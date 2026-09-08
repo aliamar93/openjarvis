@@ -13,7 +13,13 @@ from rich.markup import escape
 
 from openjarvis.cli._runtime_panel import runtime_cli_options
 from openjarvis.cli._tool_names import resolve_tool_names
-from openjarvis.cli._voice_chat import VOICE_EXIT, VoiceSession, read_voice_input, speak
+from openjarvis.cli._voice_chat import (
+    VOICE_EXIT,
+    VoiceSession,
+    read_voice_input,
+    speak,
+    speak_stream,
+)
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
@@ -469,6 +475,7 @@ def chat(
 
         # Generate response even when optional memory context is unavailable.
         try:
+            streamed = False
             if agent is not None:
                 from openjarvis.agents._stubs import AgentContext
 
@@ -478,10 +485,30 @@ def chat(
                 for msg in history[:-1]:
                     if msg.role != Role.SYSTEM:
                         agent_context.conversation.add(msg)
-                response = agent.run(user_input, context=agent_context)
-                content = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
+
+                deltas = None
+                if voice_mode and hasattr(agent, "run_stream"):
+                    # Stream tokens straight into TTS: speech starts on the
+                    # first completed sentence instead of after the full
+                    # reply. Falls back to run() when the engine can't
+                    # stream. Streamed text is echoed plain, not as
+                    # Markdown.
+                    try:
+                        deltas = agent.run_stream(user_input, context=agent_context)
+                    except NotImplementedError:
+                        deltas = None
+                if deltas is not None:
+                    assert voice_session is not None
+                    console.print()
+                    content = speak_stream(deltas, console, voice_session)
+                    streamed = True
+                else:
+                    response = agent.run(user_input, context=agent_context)
+                    content = (
+                        response.content
+                        if hasattr(response, "content")
+                        else str(response)
+                    )
             else:
                 result = engine.generate(
                     generation_history,
@@ -495,12 +522,13 @@ def chat(
                 )
 
             history.append(Message(role=Role.ASSISTANT, content=content))
-            console.print()
-            console.print(Markdown(content))
-            console.print()
-            if voice_mode:
-                assert voice_session is not None
-                speak(content, console, voice_session)
+            if not streamed:
+                console.print()
+                console.print(Markdown(content))
+                console.print()
+                if voice_mode:
+                    assert voice_session is not None
+                    speak(content, console, voice_session)
 
             publish_completed_exchange(
                 bus,

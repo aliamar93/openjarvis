@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import logging
+import queue
+import re
+import threading
 from typing import Any, Optional
 
 from rich.markup import escape
 
+logger = logging.getLogger(__name__)
+
 VOICE_EXIT = object()
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…:])\s+")
+# Until the first audio chunk is out, clause boundaries (commas) also
+# qualify: a long opening sentence must not delay time-to-first-audio.
+_CLAUSE_SPLIT = re.compile(r"(?<=[.!?…:,;])\s+")
+# Markdown noise that TTS engines read out loud ("asterisk asterisk...").
+_MD_PATTERNS = [
+    (re.compile(r"```.*?```", re.DOTALL), " "),
+    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"\*\*?([^*]+)\*\*?"), r"\1"),
+    (re.compile(r"^#{1,6}\s*", re.MULTILINE), ""),
+    (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
+    (re.compile(r"^\s*[-*•]\s+", re.MULTILINE), ""),
+]
 
 # Backend selection is shared with the API server and lives in
 # openjarvis.speech._tts_discovery. Importing that at module level would pull
@@ -173,10 +193,204 @@ def record_voice(
         return None
 
 
-def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
-    """Synthesize and play text, reusing a healthy backend for the session."""
+def _strip_markdown(text: str) -> str:
+    for pattern, repl in _MD_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _split_sentences(
+    text: str, min_chars: int = 60, first_chunk_chars: int = 20
+) -> list[str]:
+    """Split text into sentence chunks, merging fragments below a floor.
+
+    The first chunk uses a lower floor: getting any first sentence out
+    fast is what makes the speech feel responsive, while later chunks
+    can be longer since they synthesize during playback.
+    """
+    parts = [p.strip() for p in _SENTENCE_SPLIT.split(text.strip()) if p.strip()]
+    chunks: list[str] = []
+    buf = ""
+    for part in parts:
+        buf = f"{buf} {part}".strip() if buf else part
+        floor = first_chunk_chars if not chunks else min_chars
+        if len(buf) >= floor:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _speak_chunks(chunks: list[str], backend: Any, synth_kwargs: dict) -> None:
+    """Pipeline synthesis and playback: chunk N+1 renders while N plays.
+
+    Raises only when nothing was played, so the caller's backend-fallback
+    loop can retry from silence; a failure after partial playback is
+    logged rather than re-spoken through another backend.
+    """
     from openjarvis.speech.voice_io import play_wav
 
+    done = object()
+    audio_queue: queue.Queue = queue.Queue(maxsize=2)
+    errors: list[Exception] = []
+
+    def _producer() -> None:
+        try:
+            for chunk in chunks:
+                result = backend.synthesize(chunk, **synth_kwargs)
+                if result.audio:
+                    audio_queue.put(result)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            audio_queue.put(done)
+
+    threading.Thread(target=_producer, daemon=True).start()
+
+    played = False
+    while (item := audio_queue.get()) is not done:
+        play_wav(item.audio, sample_rate=item.sample_rate)
+        played = True
+
+    if errors:
+        if not played:
+            raise errors[0]
+        logger.warning("TTS failed after partial playback: %s", errors[0])
+
+
+def speak_stream(
+    deltas: Any,
+    console: Any,
+    session: VoiceSession,
+) -> str:
+    """Echo LLM text deltas as they arrive and speak completed sentences.
+
+    Three-stage pipeline: the main thread consumes ``deltas`` (printing
+    them plain, unrendered), an incremental splitter emits sentence
+    chunks as soon as they complete, a synth thread renders them to
+    audio, and a playback thread plays them in order — so speech starts
+    on the first completed sentence while the LLM is still generating.
+
+    Returns the full response text. TTS failures degrade to silent echo
+    rather than interrupting the chat; engine errors propagate.
+    """
+    from openjarvis.speech.voice_io import play_wav
+
+    backend = None
+    synth_kwargs: dict[str, Any] = {}
+    try:
+        session.get_voice_preferences()
+        backend = session.get_tts_backend()
+        if backend is not None:
+            voice_id, speed = session.voice_for_backend(backend, console)
+            synth_kwargs = {"output_format": "wav", "speed": speed}
+            if voice_id:
+                synth_kwargs["voice_id"] = voice_id
+    except Exception as exc:
+        console.print(
+            f"[dim yellow]Voice setup failed: {_terminal_safe_text(exc)}[/dim yellow]"
+        )
+        backend = None
+
+    done = object()
+    text_queue: queue.Queue = queue.Queue()
+    audio_queue: queue.Queue = queue.Queue(maxsize=2)
+    stop = threading.Event()
+
+    def _synth() -> None:
+        try:
+            while not stop.is_set():
+                chunk = text_queue.get()
+                if chunk is done:
+                    break
+                try:
+                    result = backend.synthesize(chunk, **synth_kwargs)
+                except Exception as exc:
+                    logger.warning("Streaming TTS synthesis failed: %s", exc)
+                    continue
+                if result.audio:
+                    audio_queue.put(result)
+        finally:
+            audio_queue.put(done)
+
+    def _play() -> None:
+        while not stop.is_set():
+            item = audio_queue.get()
+            if item is done:
+                break
+            try:
+                play_wav(item.audio, sample_rate=item.sample_rate)
+            except Exception as exc:
+                logger.warning("Streaming TTS playback failed: %s", exc)
+
+    workers: list[threading.Thread] = []
+    if backend is not None:
+        workers = [
+            threading.Thread(target=_synth, daemon=True),
+            threading.Thread(target=_play, daemon=True),
+        ]
+        for worker in workers:
+            worker.start()
+
+    def _emit(chunk: str) -> None:
+        if backend is not None and chunk:
+            text_queue.put(chunk)
+
+    received: list[str] = []
+    pending = ""
+    sent_any = False
+    try:
+        for delta in deltas:
+            received.append(delta)
+            console.print(delta, end="", markup=False, highlight=False)
+            pending += delta
+            splitter = _SENTENCE_SPLIT if sent_any else _CLAUSE_SPLIT
+            parts = splitter.split(pending)
+            if len(parts) > 1:
+                # All but the last part end at a sentence boundary; merge
+                # them to the same floors as _split_sentences (small first
+                # chunk for fast time-to-first-audio, larger afterwards).
+                buf = ""
+                for part in (p.strip() for p in parts[:-1] if p.strip()):
+                    buf = f"{buf} {part}".strip() if buf else part
+                    floor = 20 if not sent_any else 60
+                    if len(buf) >= floor:
+                        _emit(_strip_markdown(buf).strip())
+                        sent_any = True
+                        buf = ""
+                # No strip(): the tail may end in the whitespace that
+                # separates it from the next delta's first word.
+                pending = f"{buf} {parts[-1]}" if buf else parts[-1]
+        _emit(_strip_markdown(pending).strip())
+    except KeyboardInterrupt:
+        # Cut speech immediately; workers are daemons and the queues die
+        # with them. Re-raise so the chat loop reports the interrupt.
+        stop.set()
+        try:
+            import sounddevice as sd
+
+            sd.stop()
+        except Exception:
+            pass
+        raise
+    finally:
+        text_queue.put(done)
+        console.print()
+
+    # Let queued speech finish before handing the prompt back (matches
+    # the blocking behavior of non-streaming speak()).
+    for worker in workers:
+        worker.join()
+    return "".join(received)
+
+
+def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
+    """Synthesize and play text, reusing a healthy backend for the session.
+
+    The text is spoken in sentence chunks, pipelined so the first
+    sentence plays while the rest is still synthesizing.
+    """
     active_session = session or VoiceSession()
 
     # Resolved before the loop: a bad config value must surface as a config
@@ -187,15 +401,17 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
         console.print(f"[red]Invalid speech config: {_terminal_safe_text(exc)}[/red]")
         return
 
+    chunks = _split_sentences(_strip_markdown(text))
+    if not chunks:
+        return
+
     while (backend := active_session.get_tts_backend()) is not None:
         try:
             voice_id, speed = active_session.voice_for_backend(backend, console)
             synth_kwargs: dict[str, Any] = {"output_format": "wav", "speed": speed}
             if voice_id:
                 synth_kwargs["voice_id"] = voice_id
-            result = backend.synthesize(text, **synth_kwargs)
-            if result.audio:
-                play_wav(result.audio, sample_rate=result.sample_rate)
+            _speak_chunks(chunks, backend, synth_kwargs)
             return
         except Exception as exc:
             console.print(
@@ -211,4 +427,11 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     )
 
 
-__all__ = ["VOICE_EXIT", "VoiceSession", "read_voice_input", "record_voice", "speak"]
+__all__ = [
+    "VOICE_EXIT",
+    "VoiceSession",
+    "read_voice_input",
+    "record_voice",
+    "speak",
+    "speak_stream",
+]
