@@ -17,6 +17,7 @@ import {
   Loader2,
   ScrollText,
   Database,
+  Orbit,
 } from 'lucide-react';
 import { ConversationList } from './ConversationList';
 import { useAppStore } from '../../lib/store';
@@ -53,6 +54,7 @@ export function Sidebar() {
   };
 
   const navItems = [
+    { path: '/jarvis', icon: Orbit, label: 'J.A.R.V.I.S' },
     { path: '/', icon: MessageSquare, label: 'Chat' },
     { path: '/dashboard', icon: BarChart3, label: 'Dashboard' },
     { path: '/data-sources', icon: Database, label: 'Data Sources' },
@@ -201,8 +203,12 @@ export function Sidebar() {
                   onClick={() => navigate(item.path)}
                   className="relative flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors w-full text-left cursor-pointer"
                   style={{
-                    background: isActive ? 'var(--color-accent-subtle)' : 'transparent',
-                    color: isActive ? 'var(--color-text)' : 'var(--color-text-secondary)',
+                    background: isActive || item.path === '/jarvis'
+                      ? 'var(--color-accent-subtle)'
+                      : 'transparent',
+                    color: isActive || item.path === '/jarvis'
+                      ? 'var(--color-accent)'
+                      : 'var(--color-text-secondary)',
                     fontWeight: isActive ? 500 : 400,
                   }}
                   onMouseEnter={(e) => {

@@ -1,0 +1,188 @@
+.jarvis-blueprint {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--color-accent) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-accent) 5%, transparent) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(ellipse at center, black 12%, transparent 78%);
+}
+
+.jarvis-hud {
+  --amp: 0;
+  --tick-scale: 0.72;
+  --hud-color: var(--color-accent);
+  --hud-arc-color: var(--color-accent-amber);
+  --hud-glow-color: var(--color-accent-glow);
+  display: block;
+  width: min(66vw, 58vh, 560px);
+  min-width: 240px;
+  overflow: visible;
+  color: var(--hud-color);
+  filter: drop-shadow(0 0 var(--glow-size, 5px) var(--hud-glow-color));
+  transform-origin: center;
+}
+
+.jarvis-hud__ring,
+.jarvis-hud__core-outline,
+.jarvis-hud__core-detail {
+  fill: none;
+  vector-effect: non-scaling-stroke;
+}
+
+.jarvis-hud__ring--outer {
+  stroke: var(--hud-color);
+  stroke-opacity: 0.3;
+  stroke-width: 0.8;
+}
+
+.jarvis-hud__ring--dots {
+  stroke: var(--hud-color);
+  stroke-dasharray: 1 4;
+  stroke-opacity: 0.55;
+  stroke-width: 1;
+}
+
+.jarvis-hud__ring--fine {
+  stroke: var(--hud-color);
+  stroke-dasharray: 1 5;
+  stroke-opacity: 0.45;
+  stroke-width: 0.8;
+}
+
+.jarvis-hud__ring--segments {
+  stroke: var(--hud-color);
+  stroke-dasharray: 4 8;
+  stroke-opacity: 0.88;
+  stroke-width: 4;
+}
+
+.jarvis-hud__ticks {
+  transform: scaleY(var(--tick-scale));
+  transform-origin: 160px 160px;
+}
+
+.jarvis-hud__tick {
+  stroke: var(--hud-color);
+  stroke-opacity: var(--tick-opacity, 0.35);
+  stroke-width: 1;
+}
+
+.jarvis-hud__tick--major {
+  stroke-width: 1.7;
+}
+
+.jarvis-hud__state-arc {
+  fill: none;
+  stroke: var(--hud-arc-color);
+  stroke-dasharray: 100 600;
+  stroke-linecap: round;
+  stroke-width: 5;
+  opacity: 0;
+  transform-origin: 160px 160px;
+}
+
+.jarvis-hud__core-outline {
+  stroke: var(--hud-color);
+  stroke-opacity: 0.7;
+  stroke-width: 1.2;
+}
+
+.jarvis-hud__core-detail {
+  stroke: var(--hud-color);
+  stroke-opacity: 0.2;
+  stroke-width: 0.7;
+}
+
+.jarvis-hud__wordmark {
+  fill: var(--color-text);
+  font-family: var(--font-hud);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 3px;
+}
+
+.jarvis-hud__caption {
+  fill: var(--color-text-secondary);
+  font-family: var(--font-hud);
+  font-size: 6px;
+  letter-spacing: 1.4px;
+}
+
+.jarvis-hud--idle .jarvis-hud__outer-spin {
+  opacity: 0.55;
+}
+
+.jarvis-hud--idle {
+  --hud-color: var(--color-text-tertiary);
+  --hud-glow-color: color-mix(in srgb, var(--color-text-tertiary) 28%, transparent);
+  animation: none;
+}
+
+.jarvis-hud--listening {
+  --hud-arc-color: var(--color-accent);
+  animation: none;
+}
+
+.jarvis-hud--hearing,
+.jarvis-hud--transcribing,
+.jarvis-hud--thinking,
+.jarvis-hud--speaking,
+.jarvis-hud--error {
+  animation: jarvis-pulse 2.2s ease-in-out infinite;
+}
+
+.jarvis-hud--listening,
+.jarvis-hud--hearing,
+.jarvis-hud--transcribing,
+.jarvis-hud--thinking {
+  --hud-color: var(--color-accent);
+  --hud-arc-color: var(--color-accent);
+}
+
+.jarvis-hud--speaking {
+  --hud-color: var(--color-accent);
+  --hud-arc-color: var(--color-accent-amber);
+}
+
+.jarvis-hud--paused {
+  --hud-arc-color: var(--color-error);
+  animation: none;
+}
+
+.jarvis-hud--error {
+  --hud-color: var(--color-error);
+  --hud-arc-color: var(--color-error);
+  --hud-glow-color: color-mix(in srgb, var(--color-error) 38%, transparent);
+}
+
+.jarvis-hud:not(.jarvis-hud--idle) .jarvis-hud__state-arc {
+  opacity: 0.72;
+  animation: jarvis-rotate 12s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jarvis-hud,
+  .jarvis-hud *,
+  .jarvis-hud--reduced,
+  .jarvis-hud--reduced * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes jarvis-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes jarvis-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 var(--pulse-low-glow, 3px) var(--hud-glow-color));
+    transform: scale(var(--pulse-low-scale, 1));
+  }
+  50% {
+    filter: drop-shadow(0 0 var(--pulse-high-glow, 7px) var(--hud-glow-color));
+    transform: scale(var(--pulse-high-scale, 1.012));
+  }
+}
