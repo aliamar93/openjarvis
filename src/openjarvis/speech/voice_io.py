@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import wave
+from typing import Any
 
 _SAMPLE_RATE = 16000
 _CHANNELS = 1
@@ -123,4 +124,122 @@ def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
     sd.wait()
 
 
-__all__ = ["play_wav", "record_until_silence"]
+def decode_audio(audio: bytes, sample_rate: int = 24000) -> tuple[Any, int]:
+    """Decode WAV bytes to ``(float32 mono samples, sample_rate)``.
+
+    16-bit PCM WAV (what the local TTS backends emit) is decoded with the
+    stdlib; other WAV encodings go through soundfile when it is installed;
+    anything else is treated as raw 16-bit PCM at ``sample_rate``.
+    """
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            if wf.getsampwidth() != 2:
+                raise wave.Error("not 16-bit PCM")
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+            pcm = wf.readframes(wf.getnframes())
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        return samples, rate
+    except (wave.Error, EOFError):
+        pass
+    try:
+        import soundfile as sf
+
+        data, rate = sf.read(io.BytesIO(audio), dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        return data, int(rate)
+    except Exception:
+        n = len(audio) // 2
+        raw = np.frombuffer(audio[: n * 2], dtype="<i2").astype(np.float32)
+        return raw / 32768.0, sample_rate
+
+
+class StreamPlayer:
+    """Gapless playback of float32 mono chunks through one output stream.
+
+    ``play_wav`` opens a device stream per clip, which leaves an audible gap
+    between clips and cannot start until a whole clip exists. Streaming TTS
+    instead hands over ~80 ms frames; this player feeds them to a single
+    stream. It holds back ``prebuffer_seconds`` of audio before starting the
+    device so a producer running only slightly faster than real time (a TTS
+    sharing the GPU with the LLM) does not underrun on the first syllables.
+    """
+
+    def __init__(self, prebuffer_seconds: float = 0.25) -> None:
+        self._prebuffer_seconds = prebuffer_seconds
+        self._stream: Any = None
+        self._rate: int | None = None
+        self._pending: list[Any] = []
+        self._pending_frames = 0
+
+    def write(self, samples: Any, sample_rate: int) -> None:
+        """Queue ``samples`` for playback, blocking while the device is busy."""
+        import numpy as np
+
+        data = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1, 1)
+        if self._rate is not None and sample_rate != self._rate:
+            self._finish()
+        self._rate = sample_rate
+        if self._stream is not None:
+            self._stream.write(data)
+            return
+        self._pending.append(data)
+        self._pending_frames += len(data)
+        if self._pending_frames >= self._prebuffer_seconds * sample_rate:
+            self._start()
+
+    def close(self) -> None:
+        """Play out everything written so far, then release the device."""
+        self._finish()
+
+    def abort(self) -> None:
+        """Stop immediately, discarding queued audio."""
+        self._pending, self._pending_frames = [], 0
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.abort()
+            stream.close()
+
+    def _start(self) -> None:
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise RuntimeError(
+                "sounddevice is required for voice output. "
+                "Install with: pip install sounddevice"
+            )
+        stream = sd.OutputStream(samplerate=self._rate, channels=1, dtype="float32")
+        stream.start()
+        self._stream = stream
+        pending, self._pending, self._pending_frames = self._pending, [], 0
+        for block in pending:
+            stream.write(block)
+
+    def _finish(self) -> None:
+        if self._stream is None and self._pending:
+            self._start()
+        stream, self._stream = self._stream, None
+        self._rate = None
+        if stream is not None:
+            # PortAudio's stop waits for queued buffers to finish playing.
+            stream.stop()
+            stream.close()
+
+
+def open_stream_player() -> StreamPlayer:
+    """Return a player for one spoken reply (seam for tests)."""
+    return StreamPlayer()
+
+
+__all__ = [
+    "StreamPlayer",
+    "decode_audio",
+    "open_stream_player",
+    "play_wav",
+    "record_until_silence",
+]

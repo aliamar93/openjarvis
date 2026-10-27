@@ -8,6 +8,10 @@ time-to-first-audio, and TTS problems never interrupt the chat.
 
 from __future__ import annotations
 
+import io
+import wave
+
+import numpy as np
 import pytest
 
 from openjarvis.cli._voice_chat import (
@@ -16,6 +20,16 @@ from openjarvis.cli._voice_chat import (
     speak_stream,
 )
 from openjarvis.speech.tts import TTSResult
+
+
+def _wav(n_samples: int, rate: int = 24000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return buf.getvalue()
 
 
 class _Console:
@@ -27,6 +41,8 @@ class _Console:
 
 
 class _Backend:
+    """Whole-clip backend: one WAV per chunk, len(text) samples long."""
+
     backend_id = "fake"
 
     def __init__(self, fail_on: str | None = None) -> None:
@@ -37,11 +53,30 @@ class _Backend:
         if self._fail_on is not None and self._fail_on in text:
             raise RuntimeError("synth failed")
         self.synthesized.append(text)
-        return TTSResult(audio=text.encode(), format="wav", sample_rate=24000)
+        return TTSResult(audio=_wav(len(text)), format="wav", sample_rate=24000)
+
+
+class _StreamingBackend:
+    """Frame-streaming backend: three frames per chunk, tagged by order."""
+
+    backend_id = "fake-stream"
+
+    def __init__(self) -> None:
+        self.streamed: list[tuple[str, dict]] = []
+        self._next = 0
+
+    def synthesize(self, text: str, **kwargs) -> TTSResult:  # pragma: no cover
+        raise AssertionError("streaming backends must not be synthesized whole")
+
+    def synthesize_stream(self, text: str, **kwargs):
+        self.streamed.append((text, kwargs))
+        for _ in range(3):
+            self._next += 1
+            yield np.full(4, self._next, dtype=np.float32), 22050
 
 
 class _Session:
-    def __init__(self, backend: _Backend | None) -> None:
+    def __init__(self, backend) -> None:
         self._backend = backend
 
     def get_voice_preferences(self):
@@ -54,15 +89,37 @@ class _Session:
         return ("voice-1", 1.0)
 
 
+class _Recorder:
+    """Stands in for ``voice_io.open_stream_player`` and its players."""
+
+    def __init__(self, fail_writes: bool = False) -> None:
+        self.opened = 0
+        self.writes: list[tuple[np.ndarray, int]] = []
+        self.closed = 0
+        self.aborted = 0
+        self.fail_writes = fail_writes
+
+    def __call__(self):
+        self.opened += 1
+        return self
+
+    def write(self, samples, sample_rate) -> None:
+        if self.fail_writes:
+            raise OSError("no audio device")
+        self.writes.append((np.asarray(samples), sample_rate))
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def abort(self) -> None:
+        self.aborted += 1
+
+
 @pytest.fixture
-def played(monkeypatch) -> list[bytes]:
-    calls: list[bytes] = []
-
-    def _fake_play_wav(audio: bytes, sample_rate: int = 24000) -> None:
-        calls.append(audio)
-
-    monkeypatch.setattr("openjarvis.speech.voice_io.play_wav", _fake_play_wav)
-    return calls
+def played(monkeypatch) -> _Recorder:
+    recorder = _Recorder()
+    monkeypatch.setattr("openjarvis.speech.voice_io.open_stream_player", recorder)
+    return recorder
 
 
 def _words(text: str) -> list[str]:
@@ -112,7 +169,9 @@ def test_returns_full_text_and_speaks_every_word_in_order(played):
 
     assert text == "".join(deltas)
     assert _words(" ".join(backend.synthesized)) == _words(text)
-    assert played == [chunk.encode() for chunk in backend.synthesized]
+    assert [len(s) for s, _ in played.writes] == [len(c) for c in backend.synthesized]
+    assert {rate for _, rate in played.writes} == {24000}
+    assert (played.opened, played.closed, played.aborted) == (1, 1, 0)
 
 
 def test_first_chunk_is_cut_at_a_clause_boundary(played):
@@ -142,7 +201,7 @@ def test_deltas_are_echoed_to_console(played):
 def test_without_tts_backend_text_is_still_returned(played):
     text = speak_stream(iter(["Pas de voix", " ici."]), _Console(), _Session(None))
     assert text == "Pas de voix ici."
-    assert played == []
+    assert played.opened == 0 and played.writes == []
 
 
 def test_failed_chunk_is_skipped_and_the_rest_is_spoken(played):
@@ -177,3 +236,39 @@ def test_engine_error_propagates_without_hanging(played):
 
     with pytest.raises(RuntimeError, match="engine down"):
         speak_stream(_deltas(), _Console(), _Session(_Backend()))
+
+
+def test_streaming_backend_frames_are_played_in_order(played):
+    deltas = ["Première phrase assez longue pour partir. ", "Puis la suite et la fin."]
+    backend = _StreamingBackend()
+    text = speak_stream(iter(deltas), _Console(), _Session(backend))
+
+    assert text == "".join(deltas)
+    assert [chunk for chunk, _ in backend.streamed] == [
+        "Première phrase assez longue pour partir.",
+        "Puis la suite et la fin.",
+    ]
+    # Voice settings reach the stream; the whole-clip output_format does not.
+    assert backend.streamed[0][1] == {"voice_id": "voice-1", "speed": 1.0}
+    assert [int(s[0]) for s, _ in played.writes] == [1, 2, 3, 4, 5, 6]
+    assert {rate for _, rate in played.writes} == {22050}
+    assert played.closed == 1
+
+
+def test_interrupt_aborts_playback_and_propagates(played):
+    def _deltas():
+        yield "Une première phrase bien assez longue pour partir. "
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        speak_stream(_deltas(), _Console(), _Session(_StreamingBackend()))
+    assert played.aborted == 1
+
+
+def test_broken_audio_device_does_not_block_the_chat(monkeypatch):
+    recorder = _Recorder(fail_writes=True)
+    monkeypatch.setattr("openjarvis.speech.voice_io.open_stream_player", recorder)
+    deltas = ["Une phrase. " * 20]
+    text = speak_stream(iter(deltas), _Console(), _Session(_StreamingBackend()))
+    assert text == "".join(deltas)
+    assert recorder.writes == []

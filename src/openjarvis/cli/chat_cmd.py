@@ -300,6 +300,11 @@ def chat(
     # Keep voice state outside the core chat path so picker/runtime changes can
     # be layered independently. Loaded speech models live for this session.
     voice_session = VoiceSession(config) if voice_mode else None
+    if voice_session is not None:
+        # Load the TTS model while the user speaks their first question.
+        import threading
+
+        threading.Thread(target=voice_session.preload_tts, daemon=True).start()
 
     # Print banner
     voice_hint = (

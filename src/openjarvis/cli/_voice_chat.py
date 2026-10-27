@@ -66,6 +66,9 @@ class VoiceSession:
         self._tts_attempted: set[str] = set()
         self._voice_prefs: tuple[str, str, float] | None = None
         self._voice_warned: set[str] = set()
+        # A background preload and the first reply can both resolve the TTS
+        # backend; without the lock each would instantiate (and load) its own.
+        self._tts_lock = threading.Lock()
 
     def get_stt_backend(self) -> Any:
         """Resolve and health-check STT once, then reuse the loaded backend."""
@@ -87,14 +90,37 @@ class VoiceSession:
 
     def get_tts_backend(self) -> Any:
         """Return a cached healthy TTS backend, falling through once per key."""
-        if self._tts_backend is not None:
+        with self._tts_lock:
+            if self._tts_backend is not None:
+                return self._tts_backend
+
+            from openjarvis.speech._tts_discovery import get_tts_backend
+
+            preferred, _, _ = self.get_voice_preferences()
+            self._tts_backend = get_tts_backend(
+                preferred, attempted=self._tts_attempted
+            )
             return self._tts_backend
 
-        from openjarvis.speech._tts_discovery import get_tts_backend
+    def preload_tts(self) -> None:
+        """Resolve the TTS backend and load its model ahead of the first reply.
 
-        preferred, _, _ = self.get_voice_preferences()
-        self._tts_backend = get_tts_backend(preferred, attempted=self._tts_attempted)
-        return self._tts_backend
+        Meant for a background thread at session start: importing a
+        torch-based TTS and loading its model can take tens of seconds,
+        which would otherwise all land on the first spoken answer.
+        Failures are logged; the normal speak path retries and reports.
+        """
+        try:
+            backend = self.get_tts_backend()
+            preload = getattr(backend, "preload", None)
+            if callable(preload):
+                voice_id, _ = self.voice_for_backend(backend)
+                if voice_id:
+                    preload(voice_id)
+                else:
+                    preload()
+        except Exception:
+            logger.debug("TTS preload failed", exc_info=True)
 
     def get_voice_preferences(self) -> tuple[str, str, float]:
         """Resolve configured (tts_backend, voice_id, speed), cached per session."""
@@ -259,6 +285,24 @@ def _speak_chunks(chunks: list[str], backend: Any, synth_kwargs: dict) -> None:
         logger.warning("TTS failed after partial playback: %s", errors[0])
 
 
+def _iter_audio(backend: Any, text: str, synth_kwargs: dict) -> Any:
+    """Yield ``(float32 samples, sample_rate)`` for *text*.
+
+    Backends exposing ``synthesize_stream`` hand over frames while they
+    decode; others are synthesized whole and decoded into a single frame.
+    """
+    from openjarvis.speech.voice_io import decode_audio
+
+    stream = getattr(backend, "synthesize_stream", None)
+    if callable(stream):
+        kwargs = {k: v for k, v in synth_kwargs.items() if k in ("voice_id", "speed")}
+        yield from stream(text, **kwargs)
+        return
+    result = backend.synthesize(text, **synth_kwargs)
+    if result.audio:
+        yield decode_audio(result.audio, result.sample_rate)
+
+
 def speak_stream(
     deltas: Any,
     console: Any,
@@ -269,13 +313,15 @@ def speak_stream(
     Three-stage pipeline: the main thread consumes ``deltas`` (printing
     them plain, unrendered), an incremental splitter emits sentence
     chunks as soon as they complete, a synth thread renders them to
-    audio, and a playback thread plays them in order — so speech starts
-    on the first completed sentence while the LLM is still generating.
+    audio (frame by frame when the backend streams), and a playback
+    thread feeds the frames to one continuous output stream — so speech
+    starts on the first completed sentence while the LLM is still
+    generating, without waiting for that sentence to be fully rendered.
 
     Returns the full response text. TTS failures degrade to silent echo
     rather than interrupting the chat; engine errors propagate.
     """
-    from openjarvis.speech.voice_io import play_wav
+    from openjarvis.speech import voice_io
 
     backend = None
     synth_kwargs: dict[str, Any] = {}
@@ -295,8 +341,11 @@ def speak_stream(
 
     done = object()
     text_queue: queue.Queue = queue.Queue()
-    audio_queue: queue.Queue = queue.Queue(maxsize=2)
+    # Items are audio frames (~80 ms each for streaming backends), so the
+    # bound is in frames: enough to run well ahead of playback.
+    audio_queue: queue.Queue = queue.Queue(maxsize=512)
     stop = threading.Event()
+    player = voice_io.open_stream_player() if backend is not None else None
 
     def _synth() -> None:
         try:
@@ -305,22 +354,33 @@ def speak_stream(
                 if chunk is done:
                     break
                 try:
-                    result = backend.synthesize(chunk, **synth_kwargs)
+                    for frame in _iter_audio(backend, chunk, synth_kwargs):
+                        if stop.is_set():
+                            break
+                        audio_queue.put(frame)
                 except Exception as exc:
                     logger.warning("Streaming TTS synthesis failed: %s", exc)
-                    continue
-                if result.audio:
-                    audio_queue.put(result)
         finally:
             audio_queue.put(done)
 
     def _play() -> None:
+        broken = False
         while not stop.is_set():
             item = audio_queue.get()
             if item is done:
                 break
+            if broken:
+                continue
             try:
-                play_wav(item.audio, sample_rate=item.sample_rate)
+                player.write(*item)
+            except Exception as exc:
+                # One warning, not one per 80 ms frame; keep draining so the
+                # synth thread never blocks on a full queue.
+                logger.warning("Streaming TTS playback failed: %s", exc)
+                broken = True
+        if not stop.is_set() and not broken:
+            try:
+                player.close()
             except Exception as exc:
                 logger.warning("Streaming TTS playback failed: %s", exc)
 
@@ -367,12 +427,11 @@ def speak_stream(
         # Cut speech immediately; workers are daemons and the queues die
         # with them. Re-raise so the chat loop reports the interrupt.
         stop.set()
-        try:
-            import sounddevice as sd
-
-            sd.stop()
-        except Exception:
-            pass
+        if player is not None:
+            try:
+                player.abort()
+            except Exception:
+                pass
         raise
     finally:
         text_queue.put(done)

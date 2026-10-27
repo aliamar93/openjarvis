@@ -64,6 +64,52 @@ def test_cartesia_voice_routes_back_to_cartesia_only():
     assert session.voice_for_backend(_Backend("kokoro"))[0] == "bm_george"
 
 
+def test_preload_tts_warms_the_configured_voice(monkeypatch):
+    calls: list = []
+
+    class _Preloadable(_Backend):
+        def preload(self, voice_id: str = "") -> None:
+            calls.append(voice_id)
+
+    session = _session(tts_backend="pocket", voice_id="estelle")
+    monkeypatch.setattr(session, "get_tts_backend", lambda: _Preloadable("pocket"))
+    session.preload_tts()
+    assert calls == ["estelle"]
+
+
+def test_preload_tts_never_raises(monkeypatch):
+    session = _session()
+
+    def _boom():
+        raise RuntimeError("no backend")
+
+    monkeypatch.setattr(session, "get_tts_backend", _boom)
+    session.preload_tts()  # must not propagate into the chat thread
+
+
+def test_concurrent_backend_resolution_instantiates_once(monkeypatch):
+    import threading
+    import time
+
+    created: list = []
+
+    def _slow_get_tts_backend(preferred, attempted=None):
+        time.sleep(0.02)
+        created.append(preferred)
+        return _Backend(preferred)
+
+    monkeypatch.setattr(
+        "openjarvis.speech._tts_discovery.get_tts_backend", _slow_get_tts_backend
+    )
+    session = _session()
+    threads = [threading.Thread(target=session.get_tts_backend) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert created == ["kokoro"]
+
+
 def test_zero_speed_is_not_silently_rewritten():
     assert _session(voice_speed=0.0).get_voice_preferences()[2] == 0.0
 
