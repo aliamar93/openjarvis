@@ -56,13 +56,12 @@
 }
 
 .jarvis-hud__ticks {
-  transform: scaleY(var(--tick-scale));
-  transform-origin: 160px 160px;
+  transform: none;
 }
 
 .jarvis-hud__tick {
   stroke: var(--hud-color);
-  stroke-opacity: var(--tick-opacity, 0.35);
+  stroke-opacity: 0.5;
   stroke-width: 1;
 }
 

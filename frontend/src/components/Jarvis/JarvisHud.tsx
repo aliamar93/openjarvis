@@ -1,11 +1,11 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type MutableRefObject } from 'react';
 import type { JarvisState } from '../../lib/jarvis/stateMachine';
 import { jarvisStrings } from '../../lib/jarvis/strings';
 import './JarvisHud.css';
 
 interface JarvisHudProps {
   state: JarvisState;
-  level: number;
+  amplitude: MutableRefObject<number>;
   reducedMotion: boolean;
 }
 
@@ -22,9 +22,8 @@ const ticks = Array.from({ length: 64 }, (_, index) => {
   };
 });
 
-export function JarvisHud({ state, level, reducedMotion }: JarvisHudProps) {
+export function JarvisHud({ state, amplitude: amplitudeRef, reducedMotion }: JarvisHudProps) {
   const svgRef = useRef<SVGSVGElement>(null);
-  const safeLevel = Number.isFinite(level) ? Math.min(1, Math.max(0, level)) : 0;
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -35,27 +34,36 @@ export function JarvisHud({ state, level, reducedMotion }: JarvisHudProps) {
     let amplitude = 0;
 
     const updateAmplitude = () => {
-      const target = reducedMotion || motionPreference.matches ? 0 : safeLevel;
+      const value = amplitudeRef.current;
+      const target = reducedMotion || motionPreference.matches || !Number.isFinite(value)
+        ? 0
+        : Math.min(1, Math.max(0, value));
       amplitude += (target - amplitude) * 0.16;
       if (Math.abs(target - amplitude) < 0.004) amplitude = target;
 
       svg.style.setProperty('--amp', amplitude.toFixed(3));
-      svg.style.setProperty('--tick-scale', (0.72 + amplitude * 0.5).toFixed(3));
-      svg.style.setProperty('--tick-opacity', (0.35 + amplitude * 0.35).toFixed(3));
       svg.style.setProperty('--glow-size', `${(5 + amplitude * 7).toFixed(2)}px`);
       svg.style.setProperty('--pulse-low-glow', `${(3 + amplitude * 7).toFixed(2)}px`);
       svg.style.setProperty('--pulse-high-glow', `${(7 + amplitude * 12).toFixed(2)}px`);
       svg.style.setProperty('--pulse-low-scale', (1 + amplitude * 0.018).toFixed(3));
       svg.style.setProperty('--pulse-high-scale', (1.012 + amplitude * 0.025).toFixed(3));
 
-      if (amplitude !== target) {
+      if (amplitude !== target || (!reducedMotion && !motionPreference.matches)) {
         frame = window.requestAnimationFrame(updateAmplitude);
       }
     };
 
     frame = window.requestAnimationFrame(updateAmplitude);
-    return () => window.cancelAnimationFrame(frame);
-  }, [reducedMotion, safeLevel]);
+    const onMotionPreferenceChange = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(updateAmplitude);
+    };
+    motionPreference.addEventListener('change', onMotionPreferenceChange);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      motionPreference.removeEventListener('change', onMotionPreferenceChange);
+    };
+  }, [amplitudeRef, reducedMotion]);
 
   return (
     <svg

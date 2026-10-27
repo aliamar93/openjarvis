@@ -37,4 +37,18 @@ describe('Jarvis state machine', () => {
     const finalState = events.reduce(transition, 'idle' as JarvisState);
     expect(finalState).toBe('idle');
   });
+
+  it('leaves transcription error and permits listening again', () => {
+    const events: JarvisEvent[] = [
+      { type: 'START_LISTENING' },
+      { type: 'AUDIO_DETECTED' },
+      { type: 'TRANSCRIPTION_STARTED' },
+      { type: 'FAIL' },
+      { type: 'RESET' },
+      { type: 'START_LISTENING' },
+    ];
+
+    const finalState = events.reduce(transition, 'idle' as JarvisState);
+    expect(finalState).toBe('listening');
+  });
 });

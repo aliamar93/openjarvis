@@ -48,24 +48,30 @@ export const VALID_TRANSITIONS: Record<
   transcribing: {
     TRANSCRIPTION_COMPLETED: 'thinking',
     PAUSE: 'paused',
+    STOP_LISTENING: 'idle',
     FAIL: 'error',
   },
   thinking: {
     RESPONSE_STARTED: 'speaking',
+    RESPONSE_COMPLETED: 'idle',
     PAUSE: 'paused',
+    STOP_LISTENING: 'idle',
     FAIL: 'error',
   },
   speaking: {
     RESPONSE_COMPLETED: 'idle',
     PAUSE: 'paused',
+    STOP_LISTENING: 'idle',
     FAIL: 'error',
   },
   paused: {
     RESUME: 'idle',
+    STOP_LISTENING: 'idle',
     FAIL: 'error',
   },
   error: {
     RESET: 'idle',
+    STOP_LISTENING: 'idle',
   },
 };
 

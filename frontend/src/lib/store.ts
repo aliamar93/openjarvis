@@ -52,6 +52,14 @@ function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+function readLocalStorage(key: string): string | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 function loadConversations(): ConversationStore {
   try {
     const raw = localStorage.getItem(CONVERSATIONS_KEY);
@@ -185,7 +193,7 @@ interface AppState {
   // Actions: conversations
   loadConversations: () => void;
   importOverlayConversation: () => Promise<void>;
-  createConversation: (model?: string) => string;
+  createConversation: (model?: string, title?: string) => string;
   selectConversation: (id: string) => void;
   deleteConversation: (id: string) => void;
   loadMessages: (conversationId: string | null) => void;
@@ -292,11 +300,11 @@ export const useAppStore = create<AppState>((set, get) => {
     sidebarOpen: true,
     systemPanelOpen: true,
 
-    optInEnabled: localStorage.getItem(OPTIN_KEY) === 'true',
-    optInDisplayName: localStorage.getItem(OPTIN_NAME_KEY) || '',
-    optInEmail: localStorage.getItem(OPTIN_EMAIL_KEY) || '',
-    optInAnonId: localStorage.getItem(OPTIN_ANONID_KEY) || crypto.randomUUID(),
-    optInModalSeen: localStorage.getItem(OPTIN_SEEN_KEY) === 'true',
+    optInEnabled: readLocalStorage(OPTIN_KEY) === 'true',
+    optInDisplayName: readLocalStorage(OPTIN_NAME_KEY) || '',
+    optInEmail: readLocalStorage(OPTIN_EMAIL_KEY) || '',
+    optInAnonId: readLocalStorage(OPTIN_ANONID_KEY) || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    optInModalSeen: readLocalStorage(OPTIN_SEEN_KEY) === 'true',
     optInModalOpen: false,
 
     // ── Conversations ───────────────────────────────────────────────
@@ -347,11 +355,11 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    createConversation: (model?: string) => {
+    createConversation: (model?: string, title?: string) => {
       const store = loadConversations();
       const conv: Conversation = {
         id: generateId(),
-        title: 'New chat',
+        title: title || 'New chat',
         createdAt: Date.now(),
         updatedAt: Date.now(),
         model: model || get().selectedModel || 'default',

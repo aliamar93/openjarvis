@@ -10,7 +10,9 @@ describe('JarvisPage', () => {
     expect(markup).toContain('aria-live="polite"');
     expect(markup).toContain('<details');
     expect(markup).not.toContain('<details open');
-    expect(markup).toContain('aria-label="Campo de texto de demonstração, sem envio"');
+    expect(markup).toContain('aria-label="Mensagem para o J.A.R.V.I.S."');
+    expect(markup).toContain('Ativar escuta');
+    expect(markup).toContain('Configurações de voz');
     expect(markup).not.toContain('listitem');
   });
 });

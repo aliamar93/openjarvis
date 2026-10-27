@@ -141,6 +141,77 @@ def test_faster_whisper_falls_back_from_unsupported_float16():
     mock_whisper.assert_called_once_with("base", device="cpu", compute_type="int8")
 
 
+def test_faster_whisper_auto_device_retries_on_cpu_when_cuda_runtime_is_missing():
+    mock_segment = MagicMock(text=" Recovered", start=0.0, end=1.0)
+    mock_info = MagicMock(
+        language="en",
+        language_probability=0.9,
+        duration=1.0,
+    )
+    created_models = []
+
+    def fake_whisper_model(model_size, *, device, compute_type):
+        created_models.append((model_size, device, compute_type))
+        model = MagicMock()
+        if device == "auto":
+            def fail_during_inference():
+                raise RuntimeError(
+                    "Library cublas64_12.dll is not found or cannot be loaded"
+                )
+                yield
+
+            model.transcribe.return_value = (fail_during_inference(), mock_info)
+        else:
+            model.transcribe.return_value = ([mock_segment], mock_info)
+        return model
+
+    with (
+        patch(
+            "openjarvis.speech.faster_whisper.WhisperModel",
+            side_effect=fake_whisper_model,
+        ),
+        patch(
+            "openjarvis.speech.faster_whisper.ctranslate2",
+            MagicMock(
+                get_supported_compute_types=MagicMock(
+                    return_value={"float32", "int8"}
+                )
+            ),
+        ),
+    ):
+        backend = FasterWhisperBackend(model_size="base", device="auto")
+        result = backend.transcribe(b"fake audio bytes")
+
+    assert result.text == "Recovered"
+    assert [device for _, device, _ in created_models] == ["auto", "cpu"]
+    assert backend._device == "cpu"
+
+
+def test_faster_whisper_auto_device_does_not_retry_for_non_cuda_errors():
+    mock_model = MagicMock()
+    mock_model.transcribe.side_effect = RuntimeError("audio decode failed")
+
+    with (
+        patch(
+            "openjarvis.speech.faster_whisper.WhisperModel",
+            return_value=mock_model,
+        ) as mock_whisper,
+        patch(
+            "openjarvis.speech.faster_whisper.ctranslate2",
+            MagicMock(
+                get_supported_compute_types=MagicMock(
+                    return_value={"float32", "int8"}
+                )
+            ),
+        ),
+    ):
+        backend = FasterWhisperBackend(model_size="base", device="auto")
+        with pytest.raises(RuntimeError, match="audio decode failed"):
+            backend.transcribe(b"fake audio bytes")
+
+    mock_whisper.assert_called_once_with("base", device="auto", compute_type="int8")
+
+
 def test_faster_whisper_missing_dependency_hint_uses_desktop_extra():
     with patch("openjarvis.speech.faster_whisper.WhisperModel", new=None):
         backend = FasterWhisperBackend()

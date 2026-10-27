@@ -60,6 +60,25 @@ def test_transcribe_endpoint(client, mock_speech_backend):
     assert data["duration_seconds"] == 1.5
 
 
+def test_transcribe_endpoint_passes_wav_format_and_language(
+    client, mock_speech_backend
+):
+    audio = b"fake wav audio"
+
+    response = client.post(
+        "/v1/speech/transcribe",
+        files={"file": ("speech.wav", audio, "audio/wav")},
+        data={"language": "pt"},
+    )
+
+    assert response.status_code == 200
+    mock_speech_backend.transcribe.assert_called_once_with(
+        audio,
+        format="wav",
+        language="pt",
+    )
+
+
 def test_transcribe_endpoint_offloads_backend_work(client, mock_speech_backend):
     expected = TranscriptionResult(
         text="Offloaded",

@@ -23,6 +23,11 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_cuda_runtime_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in ("cuda", "cublas", "cudnn"))
+
+
 @SpeechRegistry.register("faster-whisper")
 class FasterWhisperBackend(SpeechBackend):
     """Local speech-to-text using Faster-Whisper (CTranslate2)."""
@@ -120,8 +125,24 @@ class FasterWhisperBackend(SpeechBackend):
                 if language:
                     kwargs["language"] = language
 
-                segments_iter, info = model.transcribe(tmp.name, **kwargs)
-                segments_list = list(segments_iter)
+                def transcribe_with(active_model: WhisperModel):
+                    segments_iter, transcription_info = active_model.transcribe(
+                        tmp.name, **kwargs
+                    )
+                    return list(segments_iter), transcription_info
+
+                try:
+                    segments_list, info = transcribe_with(model)
+                except RuntimeError as exc:
+                    if self._device != "auto" or not _is_cuda_runtime_error(exc):
+                        raise
+                    logger.warning(
+                        "Faster-Whisper auto device could not use its CUDA runtime; "
+                        "retrying transcription on CPU"
+                    )
+                    self._device = "cpu"
+                    self._model = None
+                    segments_list, info = transcribe_with(self._ensure_model())
             finally:
                 try:
                     os.unlink(tmp.name)
