@@ -484,6 +484,29 @@ class TestParseStructuredResponse:
         assert parsed["final_answer"] == "42"
         assert parsed["thought"] == "done"
 
+    def test_tool_word_inside_thought_is_not_a_tool_call(self):
+        parsed = OrchestratorAgent._parse_structured_response(
+            "THOUGHT: I need a tool: search is probably best here\n"
+            "TOOL: calculator\nINPUT: 2+2"
+        )
+        assert parsed["tool"] == "calculator"
+        assert parsed["input"] == "2+2"
+
+    def test_final_answer_phrase_inside_thought_is_ignored(self):
+        parsed = OrchestratorAgent._parse_structured_response(
+            "THOUGHT: Before I give the final answer: compute first\n"
+            "TOOL: calculator\nINPUT: 2+2"
+        )
+        assert parsed["final_answer"] == ""
+        assert parsed["tool"] == "calculator"
+
+    def test_input_word_inside_thought_is_ignored(self):
+        parsed = OrchestratorAgent._parse_structured_response(
+            "THOUGHT: the INPUT: field must be JSON\n"
+            "TOOL: calculator\nINPUT: 2+2"
+        )
+        assert parsed["input"] == "2+2"
+
     def test_parse_empty(self):
         parsed = OrchestratorAgent._parse_structured_response("")
         assert parsed["thought"] == ""
