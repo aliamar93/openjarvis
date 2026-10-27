@@ -204,7 +204,24 @@ class OrchestratorAgent(ToolUsingAgent):
                 if denial is not None:
                     tool_result = denial
                 else:
-                    tool_result = self._executor.execute(tool_call)
+                    # Same loop-guard check as function-calling mode: without
+                    # it a model repeating one call was only stopped by
+                    # max_turns.
+                    verdict = (
+                        self._loop_guard.check_call(
+                            tool_call.name, tool_call.arguments
+                        )
+                        if self._loop_guard
+                        else None
+                    )
+                    if verdict is not None and verdict.blocked:
+                        tool_result = ToolResult(
+                            tool_name=tool_call.name,
+                            content=f"Loop guard: {verdict.reason}",
+                            success=False,
+                        )
+                    else:
+                        tool_result = self._executor.execute(tool_call)
                 all_tool_results.append(tool_result)
 
                 if tool_result.success:
