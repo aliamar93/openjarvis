@@ -8,6 +8,7 @@ ID like ``bm_george`` can never reach OpenAI or Cartesia on fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,6 +109,64 @@ def test_concurrent_backend_resolution_instantiates_once(monkeypatch):
     for t in threads:
         t.join()
     assert created == ["kokoro"]
+
+
+def test_preload_loads_turn_detector_then_stt_then_tts(monkeypatch):
+    order: list[str] = []
+    session = _session()
+    for name in ("preload_turn_detector", "preload_stt", "preload_tts"):
+        monkeypatch.setattr(session, name, lambda n=name: order.append(n))
+    session.preload()
+    assert order == ["preload_turn_detector", "preload_stt", "preload_tts"]
+
+
+def test_concurrent_stt_resolution_loads_one_model(monkeypatch):
+    import threading
+    import time
+
+    created: list = []
+
+    def _slow_get_speech_backend(config):
+        time.sleep(0.02)
+        created.append(config)
+        return object()
+
+    monkeypatch.setattr(
+        "openjarvis.speech._discovery.get_speech_backend", _slow_get_speech_backend
+    )
+    session = _session()
+    threads = [threading.Thread(target=session.get_stt_backend) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(created) == 1
+    assert session.stt_ready
+
+
+def test_preload_stt_never_raises(monkeypatch):
+    session = _session()
+
+    def _boom():
+        raise RuntimeError("no stt")
+
+    monkeypatch.setattr(session, "get_stt_backend", _boom)
+    session.preload_stt()
+
+
+def test_preload_turn_detector_uses_configured_model_and_never_raises(monkeypatch):
+    seen: list[str] = []
+
+    def _load(path=""):
+        seen.append(path)
+        raise RuntimeError("onnxruntime exploded")
+
+    monkeypatch.setattr("openjarvis.speech.turn_detection.load_turn_models", _load)
+    session = VoiceSession(
+        config=SimpleNamespace(speech=SimpleNamespace(turn_model=" C:/st.onnx "))
+    )
+    session.preload_turn_detector()
+    assert seen == ["C:/st.onnx"]
 
 
 def test_zero_speed_is_not_silently_rewritten():

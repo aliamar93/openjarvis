@@ -132,6 +132,51 @@ def test_sample_rate_change_drains_and_reopens(device):
     ]
 
 
+def test_writes_are_split_into_short_blocks(device):
+    player = StreamPlayer(prebuffer_seconds=0.0)
+    player.write(np.zeros(2500, dtype=np.float32), 8000)
+    assert [e[2] for e in device if e[0] == "write"] == [1024, 1024, 452]
+
+
+def test_interrupt_from_another_thread_stops_writing_without_touching_device(
+    device,
+):
+    player = StreamPlayer(prebuffer_seconds=0.0)
+    player.write(np.zeros(10, dtype=np.float32), 8000)
+    player.interrupt()  # e.g. Ctrl-C handled on the main thread
+    player.write(np.zeros(5000, dtype=np.float32), 8000)
+    assert [e[0] for e in device] == ["open", "start", "write"]
+    player.abort()  # the playing thread then releases the device
+    assert [e[0] for e in device][-2:] == ["abort", "close"]
+
+
+def test_play_wav_silences_the_device_on_ctrl_c(monkeypatch):
+    pytest.importorskip("soundfile")
+    from openjarvis.speech.voice_io import play_wav
+
+    calls: list[str] = []
+
+    class _Stream:
+        checks = 0
+
+        @property
+        def active(self):
+            _Stream.checks += 1
+            if _Stream.checks == 2:  # Ctrl-C while the clip is playing
+                raise KeyboardInterrupt
+            return True
+
+    fake_sd = SimpleNamespace(
+        play=lambda data, sr: calls.append("play"),
+        get_stream=lambda: _Stream(),
+        stop=lambda: calls.append("stop"),
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    with pytest.raises(KeyboardInterrupt):
+        play_wav(_wav([0] * 100))
+    assert calls == ["play", "stop"]
+
+
 def test_abort_discards_queued_audio(device):
     player = StreamPlayer(prebuffer_seconds=0.0)
     player.write(np.zeros(10, dtype=np.float32), 8000)

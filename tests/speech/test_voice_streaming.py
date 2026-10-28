@@ -9,6 +9,8 @@ time-to-first-audio, and TTS problems never interrupt the chat.
 from __future__ import annotations
 
 import io
+import threading
+import time
 import wave
 
 import numpy as np
@@ -92,12 +94,14 @@ class _Session:
 class _Recorder:
     """Stands in for ``voice_io.open_stream_player`` and its players."""
 
-    def __init__(self, fail_writes: bool = False) -> None:
+    def __init__(self, fail_writes: bool = False, write_delay: float = 0.0) -> None:
         self.opened = 0
         self.writes: list[tuple[np.ndarray, int]] = []
         self.closed = 0
         self.aborted = 0
+        self.interrupted = 0
         self.fail_writes = fail_writes
+        self.write_delay = write_delay
 
     def __call__(self):
         self.opened += 1
@@ -106,6 +110,8 @@ class _Recorder:
     def write(self, samples, sample_rate) -> None:
         if self.fail_writes:
             raise OSError("no audio device")
+        if self.write_delay:
+            time.sleep(self.write_delay)
         self.writes.append((np.asarray(samples), sample_rate))
 
     def close(self) -> None:
@@ -113,6 +119,19 @@ class _Recorder:
 
     def abort(self) -> None:
         self.aborted += 1
+
+    def interrupt(self) -> None:
+        self.interrupted += 1
+
+
+def _eventually(predicate, timeout: float = 3.0) -> bool:
+    """The playback thread releases the device asynchronously after a cut."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 @pytest.fixture
@@ -238,6 +257,77 @@ def test_engine_error_propagates_without_hanging(played):
         speak_stream(_deltas(), _Console(), _Session(_Backend()))
 
 
+def test_engine_error_lets_queued_speech_finish_first(played):
+    def _deltas():
+        yield "Une première phrase bien assez longue pour partir. "
+        raise RuntimeError("engine down")
+
+    with pytest.raises(RuntimeError, match="engine down"):
+        speak_stream(_deltas(), _Console(), _Session(_StreamingBackend()))
+    # Playback was drained (not aborted) before the error surfaced, so a
+    # hands-free loop cannot reopen the mic over the speaker.
+    assert len(played.writes) == 3
+    assert (played.closed, played.aborted) == (1, 0)
+
+
+def test_ctrl_c_while_waiting_for_speech_cuts_it(monkeypatch, played):
+    monkeypatch.setattr(
+        "openjarvis.cli._voice_chat._join_workers",
+        lambda workers: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        speak_stream(iter(["Bonjour Denis."]), _Console(), _Session(_Backend()))
+    assert played.interrupted == 1
+    # The playback thread, which owns the device, releases it.
+    assert _eventually(lambda: played.aborted == 1)
+    assert played.closed == 0
+
+
+class _LockedStreamingBackend:
+    """Like PocketTTSBackend: the backend lock is held across the yields."""
+
+    backend_id = "locked"
+
+    def __init__(self, frames: int) -> None:
+        self._lock = threading.Lock()
+        self._frames = frames
+
+    def synthesize_stream(self, text, **kwargs):
+        with self._lock:
+            for _ in range(self._frames):
+                yield np.zeros(4, np.float32), 24000
+
+
+def test_a_cut_long_reply_does_not_wedge_the_next_one(monkeypatch):
+    # More frames than the audio queue holds, played slower than they are
+    # produced: before the fix, the synth thread blocked forever on a full
+    # queue while holding the backend lock, and the next reply hung.
+    recorder = _Recorder(write_delay=0.002)
+    monkeypatch.setattr("openjarvis.speech.voice_io.open_stream_player", recorder)
+    backend = _LockedStreamingBackend(frames=700)
+
+    def _cut_after_first_sentence():
+        yield "Une première phrase bien assez longue pour partir. "
+        time.sleep(0.2)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        speak_stream(_cut_after_first_sentence(), _Console(), _Session(backend))
+
+    backend._frames = 3
+    result: list = []
+    second = threading.Thread(
+        target=lambda: result.append(
+            speak_stream(iter(["Encore une réponse."]), _Console(), _Session(backend))
+        ),
+        daemon=True,
+    )
+    second.start()
+    second.join(5)
+    assert not second.is_alive(), "second reply hung after the cut"
+    assert result == ["Encore une réponse."]
+
+
 def test_streaming_backend_frames_are_played_in_order(played):
     deltas = ["Première phrase assez longue pour partir. ", "Puis la suite et la fin."]
     backend = _StreamingBackend()
@@ -262,7 +352,8 @@ def test_interrupt_aborts_playback_and_propagates(played):
 
     with pytest.raises(KeyboardInterrupt):
         speak_stream(_deltas(), _Console(), _Session(_StreamingBackend()))
-    assert played.aborted == 1
+    assert played.interrupted == 1
+    assert _eventually(lambda: played.aborted == 1)
 
 
 def test_broken_audio_device_does_not_block_the_chat(monkeypatch):
