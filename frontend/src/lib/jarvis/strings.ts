@@ -8,7 +8,7 @@ export const jarvisStrings = {
   status: {
     idle: 'Aguardando ativação.',
     listening: 'Ouvindo. O microfone está ativo.',
-    hearing: 'Áudio detectado.',
+    hearing: 'Interrompido. Ouvindo você.',
     transcribing: 'Transcrevendo sua fala.',
     thinking: 'Pensando. O modelo pode levar alguns instantes.',
     speaking: 'Falando.',

@@ -18,9 +18,14 @@ import {
   ScrollText,
   Database,
   Orbit,
+  LogOut,
 } from 'lucide-react';
 import { ConversationList } from './ConversationList';
 import { useAppStore } from '../../lib/store';
+import { apiFetch } from '../../lib/api';
+import { useAuthStore } from '../../lib/auth';
+import { useTtsStore } from '../../lib/tts';
+import { toast } from 'sonner';
 
 export function Sidebar() {
   const navigate = useNavigate();
@@ -35,12 +40,27 @@ export function Sidebar() {
   const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
   const modelLoading = useAppStore((s) => s.modelLoading);
   const deepResearch = useAppStore((s) => s.deepResearch);
+  const authUser = useAuthStore((s) => s.user);
 
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
 
   const ThemeIcon = settings.theme === 'light' ? Sun : settings.theme === 'dark' ? Moon : Monitor;
   const nextTheme = settings.theme === 'light' ? 'dark' : settings.theme === 'dark' ? 'system' : 'light';
+
+  const handleLogout = async () => {
+    useTtsStore.getState().stop();
+    useAuthStore.getState().clearUser();
+    try {
+      await useAppStore.getState().flushConversationSync();
+      useAppStore.getState().clearUserData();
+      const response = await apiFetch('/auth/logout', { method: 'POST' });
+      if (!response.ok) throw new Error();
+    } catch {
+      useAppStore.getState().clearUserData();
+      toast.error('A sessão local foi encerrada, mas o servidor não confirmou o logout.');
+    }
+  };
 
   const messages = useAppStore((s) => s.messages);
   const handleNewChat = () => {
@@ -234,6 +254,35 @@ export function Sidebar() {
               );
             })}
           </nav>
+          <div
+            className="flex items-center gap-3 px-4 py-3"
+            style={{ borderTop: '1px solid var(--color-border)' }}
+          >
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                {authUser?.name}
+              </p>
+              <p className="text-xs capitalize" style={{ color: 'var(--color-text-secondary)' }}>
+                {authUser?.role === 'admin' ? 'Administrador' : 'Usuário'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              aria-label="Sair"
+              title="Sair"
+              className="rounded-lg p-2 transition-colors"
+              style={{ color: 'var(--color-text-secondary)' }}
+              onMouseEnter={(event) => {
+                event.currentTarget.style.background = 'var(--color-bg-secondary)';
+              }}
+              onMouseLeave={(event) => {
+                event.currentTarget.style.background = 'transparent';
+              }}
+            >
+              <LogOut size={16} />
+            </button>
+          </div>
         </div>
       </aside>
     </>

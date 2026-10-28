@@ -79,4 +79,42 @@ describe('conversation stream ownership', () => {
       store.getState().conversations.map((conversation) => conversation.id),
     ).not.toContain(sourceId);
   });
+
+  it('updates an interrupted voice response by ID after newer messages exist', async () => {
+    const store = await freshStore();
+    const conversationId = store.getState().createConversation('test-model');
+    store.getState().addMessage(conversationId, {
+      id: 'interrupted-assistant',
+      role: 'assistant',
+      content: 'Resposta parcial.',
+      timestamp: 1,
+    });
+    store.getState().addMessage(conversationId, {
+      id: 'new-user',
+      role: 'user',
+      content: 'Nova pergunta.',
+      timestamp: 2,
+    });
+    store.getState().addMessage(conversationId, {
+      id: 'new-assistant',
+      role: 'assistant',
+      content: '',
+      timestamp: 3,
+    });
+
+    store.getState().updateMessageContent(
+      conversationId,
+      'interrupted-assistant',
+      'Resposta completa, embora interrompida.',
+    );
+
+    expect(store.getState().conversations.find((conversation) => conversation.id === conversationId)?.messages)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: 'interrupted-assistant',
+          content: 'Resposta completa, embora interrompida.',
+        }),
+        expect.objectContaining({ id: 'new-assistant', content: '' }),
+      ]));
+  });
 });

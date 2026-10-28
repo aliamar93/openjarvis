@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  classifyInterruption,
   getFinalResponseSpeech,
   JarvisResponseSpeaker,
   getRepetitionCount,
@@ -128,6 +129,130 @@ describe('Jarvis response speech', () => {
     const { speaker } = createSpeaker();
 
     expect(speaker.repeatLastResponse('repeat-1', 1)).toBeNull();
+  });
+
+  it('parks the interrupted phrase and buffers new sentences until resumed', async () => {
+    const { speaker, queue, spoken } = createSpeaker();
+
+    speaker.speakResponse('Frase que estava falando.', 'response-park', 'response-park:0');
+    speaker.speakResponse('Frase que ainda estava na fila.', 'response-park', 'response-park:1');
+    expect(speaker.parkCurrentResponse()).toBe(true);
+    speaker.updateResponseText('response-park', 'Frase que estava falando. Frase nova.');
+    speaker.speakResponse('Frase nova.', 'response-park', 'response-park:2');
+    expect(spoken).toEqual(['Frase que estava falando.']);
+
+    await queue.whenIdle();
+    const resumed = speaker.resumeLatest();
+    expect(resumed).toEqual({
+      responseId: 'response-park',
+      fullText: 'Frase que estava falando. Frase nova.',
+      complete: false,
+    });
+    await queue.whenIdle();
+    speaker.completeResponse('response-park', resumed?.fullText ?? '');
+
+    expect(spoken).toEqual([
+      'Frase que estava falando.',
+      'Frase que estava falando.',
+      'Frase que ainda estava na fila.',
+      'Frase nova.',
+    ]);
+  });
+
+  it('keeps an interrupted response parked when another response starts', async () => {
+    const { speaker, queue, spoken } = createSpeaker();
+    speaker.speakResponse('Resposta interrompida.', 'parked-1');
+    speaker.parkCurrentResponse();
+    await queue.whenIdle();
+
+    speaker.speakResponse('Resposta nova.', 'new-2');
+    await queue.whenIdle();
+    speaker.completeResponse('new-2', 'Resposta nova.');
+
+    const resumed = speaker.resumeLatest();
+    expect(resumed?.responseId).toBe('parked-1');
+    await queue.whenIdle();
+    expect(spoken).toEqual(['Resposta interrompida.', 'Resposta nova.', 'Resposta interrompida.']);
+  });
+
+  it('does not replace the latest spoken response when an older parked stream finishes later', async () => {
+    const { speaker, queue, spoken } = createSpeaker();
+    speaker.speakResponse('Resposta antiga interrompida.', 'old-response');
+    speaker.parkCurrentResponse();
+    await queue.whenIdle();
+
+    speaker.speakResponse('Resposta nova completa.', 'new-response');
+    await queue.whenIdle();
+    speaker.completeResponse('new-response', 'Resposta nova completa.');
+    speaker.completeResponse('old-response', 'Resposta antiga completa.');
+
+    expect(speaker.repeatLastResponse('repeat-new', 1)).toBe('Resposta nova completa.');
+    await queue.whenIdle();
+    expect(spoken).toEqual([
+      'Resposta antiga interrompida.',
+      'Resposta nova completa.',
+      'Resposta nova completa.',
+    ]);
+  });
+
+  it('retains only the three newest parked responses and expires them after two minutes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const { speaker, queue } = createSpeaker();
+      for (let index = 1; index <= 4; index += 1) {
+        speaker.speakResponse(`Resposta ${index}.`, `parked-${index}`);
+        speaker.parkCurrentResponse();
+        await queue.whenIdle();
+        vi.setSystemTime(index * 1000);
+      }
+
+      expect(speaker.resumeLatest()?.responseId).toBe('parked-4');
+      speaker.cancel();
+
+      const expiring = createSpeaker();
+      expiring.speaker.speakResponse('Resposta temporária.', 'temporary');
+      expiring.speaker.parkCurrentResponse();
+      await expiring.queue.whenIdle();
+      vi.setSystemTime(125_000);
+      expect(expiring.speaker.hasParkedResponse).toBe(false);
+      expect(expiring.speaker.resumeLatest()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('classifyInterruption', () => {
+  it.each([
+    'continue',
+    'continua de onde parou',
+    'pode prosseguir',
+    'pode seguir',
+    'desculpa, continua',
+    'sinto muito, prossiga com o tempo',
+    'Jarvis, que horas são, quer dizer, esquece isso, prossiga com o tempo',
+    'como você estava dizendo',
+    'voltando ao que você falava',
+  ])('recognizes resume command: %s', (text) => {
+    expect(classifyInterruption(text).type).toBe('resume');
+  });
+
+  it.each(['para', 'pare', 'chega', 'silêncio', 'fica quieto'])(
+    'recognizes stop command: %s',
+    (text) => expect(classifyInterruption(text).type).toBe('stop'),
+  );
+
+  it('classifies filler and matching speech as noise and echo', () => {
+    expect(classifyInterruption('hm').type).toBe('noise');
+    expect(classifyInterruption('A previsão do tempo é sol hoje.', 'A previsão do tempo é sol hoje.').type)
+      .toBe('echo');
+    expect(classifyInterruption('Que horas são agora?', 'A previsão do tempo para hoje é ensolarado.').type)
+      .toBe('question');
+  });
+
+  it('does not mistake an ordinary question about continuing for a resume command', () => {
+    expect(classifyInterruption('Como faço para continuar uma série no Netflix?').type).toBe('question');
   });
 });
 

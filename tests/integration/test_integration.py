@@ -162,7 +162,7 @@ class TestAPIServerRoundtrip:
 
     def test_roundtrip(self):
         pytest.importorskip("fastapi")
-        from fastapi.testclient import TestClient
+        from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
         from openjarvis.server.app import create_app
 
@@ -187,7 +187,7 @@ class TestAPIServerRoundtrip:
 
     def test_models_endpoint(self):
         pytest.importorskip("fastapi")
-        from fastapi.testclient import TestClient
+        from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
         from openjarvis.server.app import create_app
 

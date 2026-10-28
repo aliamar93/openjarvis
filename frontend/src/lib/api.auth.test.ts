@@ -37,6 +37,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   (globalThis as unknown as { localStorage?: MemoryStorage }).localStorage =
     undefined;
 });
@@ -90,6 +91,21 @@ describe('authHeaders', () => {
   });
 });
 
+describe('session expiry handling', () => {
+  it('signals 401s from protected APIs but not the session probe', async () => {
+    const target = new EventTarget();
+    vi.stubGlobal('window', target);
+    const expired = vi.fn();
+    target.addEventListener('openjarvis:auth-expired', expired);
+    const { observeApiResponse } = await freshApi();
+
+    observeApiResponse(new Response(null, { status: 401 }), '/v1/models');
+    observeApiResponse(new Response(null, { status: 401 }), '/auth/me');
+
+    expect(expired).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('tool credentials', () => {
   it('reads credential status from the local server', async () => {
     fetchMock.mockResolvedValue(
@@ -105,7 +121,7 @@ describe('tool credentials', () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       '/v1/tools/web_search/credentials/status',
-      { headers: {} },
+      { credentials: 'include', headers: {} },
     );
   });
 
@@ -121,6 +137,7 @@ describe('tool credentials', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ TAVILY_API_KEY: 'tvly-test' }),
+      credentials: 'include',
     });
   });
 
@@ -132,7 +149,7 @@ describe('tool credentials', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/v1/tools/web_search/credentials/TAVILY_API_KEY',
-      { method: 'DELETE', headers: {} },
+      { method: 'DELETE', credentials: 'include', headers: {} },
     );
   });
 });

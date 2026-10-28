@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { authHeaders, observeApiResponse } from '../../../lib/api';
 
 /**
  * Detect whether we're running inside Tauri or in a browser.
@@ -45,7 +46,10 @@ async function browserFallback<T>(
     throw new Error(`No browser fallback for command: ${command}`);
   }
 
-  const resp = await fetch(`${apiUrl}${path}`);
+  const resp = await fetch(`${apiUrl}${path}`, {
+    credentials: 'include',
+    headers: authHeaders(),
+  }).then((response) => observeApiResponse(response, path));
   if (!resp.ok) {
     throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
   }

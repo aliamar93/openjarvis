@@ -25,11 +25,26 @@ from openjarvis.server.ws_bridge import create_ws_router  # noqa: E402
 
 AUTH_PROTOCOL = "openjarvis.auth.v1"
 KEY_PROTOCOL_PREFIX = "openjarvis.key.b64url."
+_SESSION_TOKEN = "test-session"
+_TEST_USER = {"id": "test-user", "name": "Test", "role": "admin"}
+
+
+class _SessionStore:
+    def get_user_for_token(self, token):
+        return _TEST_USER if token == _SESSION_TOKEN else None
 
 
 def _auth_subprotocols(api_key: str) -> list[str]:
     encoded = base64.urlsafe_b64encode(api_key.encode()).decode().rstrip("=")
     return [AUTH_PROTOCOL, f"{KEY_PROTOCOL_PREFIX}{encoded}"]
+
+
+def _authenticated_client(app):
+    from openjarvis.server.auth_store import SESSION_COOKIE_NAME
+
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE_NAME, _SESSION_TOKEN)
+    return client
 
 
 def _ws(query=None, headers=None, subprotocols=None):
@@ -113,19 +128,28 @@ def _make_app(api_key=""):
     app.state.engine = engine
     app.state.model = "test-model"
     app.state.api_key = api_key
+    app.state.auth_store = _SessionStore()
     include_all_routes(app)
     return app
 
 
 class TestChatStreamAuth:
-    def test_rejected_without_token_when_key_set(self):
+    def test_requires_a_user_session_even_with_a_valid_api_key(self):
         client = TestClient(_make_app(api_key="secret"))
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/v1/chat/stream", subprotocols=_auth_subprotocols("secret")
+            ):
+                pass
+
+    def test_rejected_without_token_when_key_set(self):
+        client = _authenticated_client(_make_app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/v1/chat/stream") as ws:
                 ws.receive_text()
 
     def test_rejected_with_wrong_token(self):
-        client = TestClient(_make_app(api_key="secret"))
+        client = _authenticated_client(_make_app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect(
                 "/v1/chat/stream", subprotocols=_auth_subprotocols("wrong")
@@ -134,14 +158,14 @@ class TestChatStreamAuth:
 
     def test_rejected_with_query_token(self):
         # ?token= is no longer an accepted auth channel (would leak into logs).
-        client = TestClient(_make_app(api_key="secret"))
+        client = _authenticated_client(_make_app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/v1/chat/stream?token=secret") as ws:
                 ws.receive_text()
 
     def test_accepted_with_correct_token(self):
         api_key = "secret+/="
-        client = TestClient(_make_app(api_key=api_key))
+        client = _authenticated_client(_make_app(api_key=api_key))
         with client.websocket_connect(
             "/v1/chat/stream", subprotocols=_auth_subprotocols(api_key)
         ) as ws:
@@ -150,7 +174,7 @@ class TestChatStreamAuth:
             assert ws.receive_json()["type"] in ("chunk", "done", "error")
 
     def test_accepted_with_authorization_header(self):
-        client = TestClient(_make_app(api_key="secret"))
+        client = _authenticated_client(_make_app(api_key="secret"))
         with client.websocket_connect(
             "/v1/chat/stream", headers={"Authorization": "Bearer secret"}
         ) as ws:
@@ -159,13 +183,13 @@ class TestChatStreamAuth:
             assert ws.receive_json()["type"] in ("chunk", "done", "error")
 
     def test_allowed_when_no_key_configured(self):
-        client = TestClient(_make_app(api_key=""))
+        client = _authenticated_client(_make_app(api_key=""))
         with client.websocket_connect("/v1/chat/stream") as ws:
             ws.send_text(json.dumps({"message": "hi"}))
             assert ws.receive_json()["type"] in ("chunk", "done", "error")
 
     def test_keyless_server_negotiates_stale_client_auth_protocol(self):
-        client = TestClient(_make_app(api_key=""))
+        client = _authenticated_client(_make_app(api_key=""))
         with client.websocket_connect(
             "/v1/chat/stream", subprotocols=_auth_subprotocols("stale")
         ) as ws:
@@ -178,17 +202,26 @@ class TestAgentEventsAuth:
     def _app(self, api_key=""):
         app = FastAPI()
         app.state.api_key = api_key
+        app.state.auth_store = _SessionStore()
         app.include_router(create_ws_router(EventBus()))
         return app
 
     def test_rejected_without_token_when_key_set(self):
-        client = TestClient(self._app(api_key="secret"))
+        client = _authenticated_client(self._app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/v1/agents/events") as ws:
                 ws.receive_text()
 
-    def test_rejected_with_query_token(self):
+    def test_requires_a_user_session_even_with_a_valid_api_key(self):
         client = TestClient(self._app(api_key="secret"))
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/v1/agents/events", subprotocols=_auth_subprotocols("secret")
+            ):
+                pass
+
+    def test_rejected_with_query_token(self):
+        client = _authenticated_client(self._app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/v1/agents/events?token=secret") as ws:
                 ws.receive_text()
@@ -198,8 +231,9 @@ class TestAgentEventsAuth:
         app = FastAPI()
         api_key = "secret+/="
         app.state.api_key = api_key
+        app.state.auth_store = _SessionStore()
         app.include_router(create_ws_router(bus))
-        client = TestClient(app)
+        client = _authenticated_client(app)
         with client.websocket_connect(
             "/v1/agents/events", subprotocols=_auth_subprotocols(api_key)
         ) as ws:
@@ -211,8 +245,9 @@ class TestAgentEventsAuth:
         bus = EventBus()
         app = FastAPI()
         app.state.api_key = "secret"
+        app.state.auth_store = _SessionStore()
         app.include_router(create_ws_router(bus))
-        client = TestClient(app)
+        client = _authenticated_client(app)
         with client.websocket_connect(
             "/v1/agents/events", headers={"Authorization": "Bearer secret"}
         ) as ws:

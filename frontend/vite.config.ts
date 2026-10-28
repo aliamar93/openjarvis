@@ -66,6 +66,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      '/auth': apiTarget,
       // ws: true is required for the /v1/agents/events WebSocket. Without it
       // Vite proxies the HTTP request but not the upgrade, so the socket never
       // opens — no error, no close event, just silence — and every live agent

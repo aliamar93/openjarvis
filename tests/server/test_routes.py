@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from tests.server.auth_test_client import AuthenticatedTestClient as TestClient  # noqa: E402
 
 from openjarvis.core.events import EventBus, EventType  # noqa: E402
 from openjarvis.core.types import Role  # noqa: E402

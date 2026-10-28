@@ -13,6 +13,8 @@ describe('JarvisPage', () => {
     expect(markup).toContain('aria-label="Mensagem para o J.A.R.V.I.S."');
     expect(markup).toContain('Ativar escuta');
     expect(markup).toContain('Configurações de voz');
+    expect(markup).toContain('Permitir interromper o JARVIS falando');
+    expect(markup).toContain('Exigir “Jarvis” para interromper');
     expect(markup).not.toContain('listitem');
   });
 });

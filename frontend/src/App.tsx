@@ -11,7 +11,6 @@ import { LogsPage } from './pages/LogsPage';
 import { JarvisPage } from './pages/JarvisPage';
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
-import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
 import { OptInModal } from './components/OptInModal';
@@ -195,7 +194,6 @@ export default function App() {
           <Route path="jarvis" element={<JarvisPage />} />
         </Route>
       </Routes>
-      <Toaster position="bottom-right" />
       {commandPaletteOpen && <CommandPalette />}
       {optInModalOpen && (
         <OptInModal onClose={() => setOptInModalOpen(false)} />

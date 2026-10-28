@@ -66,7 +66,13 @@ def create_ws_router(event_bus: EventBus) -> Any:
     @router.websocket("/v1/agents/events")
     async def agent_events(websocket: WebSocket) -> None:
         from openjarvis.server.auth_middleware import authenticate_websocket
+        from openjarvis.server.session_auth_middleware import (
+            authenticated_websocket_user,
+        )
 
+        if authenticated_websocket_user(websocket) is None:
+            await websocket.close(code=1008)
+            return
         expected_key = getattr(websocket.app.state, "api_key", "")
         authorized, subprotocol = authenticate_websocket(websocket, expected_key)
         if not authorized:

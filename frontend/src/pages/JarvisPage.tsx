@@ -232,6 +232,17 @@ export function JarvisPage() {
               Pausar quando a aba ficar oculta
             </label>
             <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+              <input type="checkbox" checked={preferences.allowVoiceInterruption} onChange={(event) => update({ allowVoiceInterruption: event.currentTarget.checked })} />
+              Permitir interromper o JARVIS falando
+            </label>
+            <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+              <input type="checkbox" checked={preferences.interruptionRequiresWakeWord} onChange={(event) => update({ interruptionRequiresWakeWord: event.currentTarget.checked })} />
+              Exigir “Jarvis” para interromper
+            </label>
+            <p className="text-[11px] sm:col-span-2" style={{ color: 'var(--color-text-tertiary)' }}>
+              Fones de ouvido reduzem o eco e oferecem a melhor detecção de interrupções.
+            </p>
+            <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
               Limite de resposta: {preferences.thinkingTimeoutSec}s
               <input
                 type="range"

@@ -1,5 +1,5 @@
 import type { ResearchEvent, SSEEvent } from '../types';
-import { getBase, authHeaders } from './api';
+import { getBase, authHeaders, observeApiResponse } from './api';
 
 export interface ChatRequest {
   model: string;
@@ -19,7 +19,10 @@ export async function* streamChat(
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(request),
     signal,
-  });
+    credentials: 'include',
+  }).then((result) =>
+    observeApiResponse(result, '/v1/chat/completions'),
+  );
 
   if (!response.ok) {
     throw new Error(`Chat request failed: ${response.status}`);
@@ -71,7 +74,8 @@ export async function* streamResearch(
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ query, ...(model ? { model } : {}) }),
     signal,
-  });
+    credentials: 'include',
+  }).then((result) => observeApiResponse(result, '/api/research'));
 
   if (!response.ok) {
     throw new Error(`Research request failed: ${response.status}`);

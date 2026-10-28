@@ -9,7 +9,7 @@ import threading
 import time
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from openjarvis.server.analytics_routes import (
@@ -19,6 +19,11 @@ from openjarvis.server.analytics_routes import (
 from openjarvis.server.analytics_routes import (
     router as analytics_router,
 )
+from openjarvis.server.auth_routes import (
+    initialize_auth_store,
+    router as auth_router,
+)
+from openjarvis.server.auth_store import AuthStore
 from openjarvis.server.api_routes import include_all_routes
 from openjarvis.server.comparison import comparison_router
 from openjarvis.server.connectors_router import create_connectors_router
@@ -180,6 +185,7 @@ def create_app(
     api_key: str = "",
     webhook_config: dict | None = None,
     cors_origins: list[str] | None = None,
+    auth_store: AuthStore | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -307,6 +313,7 @@ def create_app(
     app.state.rate_limiter = rate_limiter
     app.state.audit_logger = audit_logger
     app.state.mcp_tools = list(mcp_tools or [])
+    app.state.frontend_static_dir = str(pathlib.Path(__file__).parent / "static")
     app.state._mcp_discovery_lock = threading.Lock()
     app.state._mcp_clients_lock = threading.Lock()
     app.state._mcp_clients = list(mcp_clients or [])
@@ -314,6 +321,9 @@ def create_app(
     app.state._managed_workers: set[threading.Thread] = set()
     app.state._managed_runtime_stopping = False
     app.state.session_start = time.time()
+    app.state.auth_store = auth_store or AuthStore()
+    initialize_auth_store(app.state.auth_store)
+    app.state.allowed_origins = list(_origins)
     # Exposed so WebSocket handlers can authenticate the handshake (the HTTP
     # AuthMiddleware never sees WS upgrade requests). Empty = auth disabled.
     app.state.api_key = api_key
@@ -474,6 +484,7 @@ def create_app(
                 except Exception:
                     pass
 
+    app.include_router(auth_router)
     app.include_router(router)
     app.include_router(dashboard_router)
     app.include_router(comparison_router)
@@ -505,6 +516,14 @@ def create_app(
             app.add_middleware(AuthMiddleware, api_key=api_key)
         except Exception as exc:
             logger.debug("Auth middleware init skipped: %s", exc)
+
+    from openjarvis.server.session_auth_middleware import SessionAuthMiddleware
+
+    app.add_middleware(
+        SessionAuthMiddleware,
+        store=app.state.auth_store,
+        allowed_origins=_origins,
+    )
 
     # Register CORS last so it is the outermost middleware. In addition to
     # handling preflights, this ensures browser clients can read 401 responses
@@ -550,6 +569,12 @@ def create_app(
         @app.get("/{full_path:path}")
         async def spa_catch_all(full_path: str):
             """Serve static files directly, fall back to index.html for SPA routes."""
+            if full_path == "health" or full_path.startswith("health/"):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+            if full_path in {"auth", "v1", "api"} or full_path.startswith(
+                ("auth/", "v1/", "api/")
+            ):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
             if full_path:
                 candidate = (static_dir / full_path).resolve()
                 # Path traversal prevention

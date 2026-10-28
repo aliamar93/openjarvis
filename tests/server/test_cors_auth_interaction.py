@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from tests.server.auth_test_client import AuthenticatedTestClient as TestClient  # noqa: E402
 
 from openjarvis.server.app import create_app  # noqa: E402
 

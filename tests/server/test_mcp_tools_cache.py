@@ -226,7 +226,7 @@ def test_preloaded_duplicate_names_are_first_wins(mock_load_config: MagicMock):
 def test_app_shutdown_stops_scheduler_before_closing_shared_mcp_clients() -> None:
     """Shutdown quiesces and drains every user of the shared MCP pool."""
 
-    from fastapi.testclient import TestClient
+    from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
     from openjarvis.core.config import JarvisConfig
     from openjarvis.server.agent_manager_routes import _start_managed_worker
@@ -300,7 +300,7 @@ def test_app_shutdown_stops_scheduler_before_closing_shared_mcp_clients() -> Non
 def test_shutdown_interrupts_mcp_client_during_lazy_initialization() -> None:
     """A client is registered before initialize() can block on transport I/O."""
 
-    from fastapi.testclient import TestClient
+    from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
     from openjarvis.core.config import JarvisConfig
     from openjarvis.server.agent_manager_routes import (
@@ -370,7 +370,7 @@ def test_shutdown_interrupts_mcp_client_during_lazy_initialization() -> None:
 def test_app_shutdown_closes_lazily_created_memory_backend(monkeypatch) -> None:
     """A backend opened by a managed route is owned and closed by the app."""
 
-    from fastapi.testclient import TestClient
+    from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
     from openjarvis.core.config import JarvisConfig
     from openjarvis.server import agent_manager_routes as routes
@@ -396,7 +396,7 @@ def test_app_shutdown_closes_lazily_created_memory_backend(monkeypatch) -> None:
 def test_app_shutdown_keeps_owned_memory_open_for_live_worker(monkeypatch) -> None:
     """A timed-out worker must never resume against a closed backend."""
 
-    from fastapi.testclient import TestClient
+    from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
     from openjarvis.core.config import JarvisConfig
     from openjarvis.server import app as app_module
@@ -460,7 +460,7 @@ def test_app_shutdown_keeps_owned_memory_open_for_live_worker(monkeypatch) -> No
 def test_app_shutdown_leaves_borrowed_memory_backend_open() -> None:
     """An injected backend remains owned by its caller unless opted in."""
 
-    from fastapi.testclient import TestClient
+    from tests.server.auth_test_client import AuthenticatedTestClient as TestClient
 
     from openjarvis.core.config import JarvisConfig
     from openjarvis.server.app import create_app

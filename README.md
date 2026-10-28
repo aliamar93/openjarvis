@@ -64,6 +64,8 @@ jarvis init --preset <name> --force  # replace config with a starter preset
 chat interface in your default browser. It requires Node.js 22+ and is
 available from a source checkout; packaged desktop installers are available
 from the [latest release](https://github.com/open-jarvis/OpenJarvis/releases).
+The web interface requires login; see the [web authentication guide](docs/user-guide/web-authentication.md)
+for first-admin setup and session configuration.
 
 > Prefix `jarvis ...` with `uv run`, or `source .venv/bin/activate` first.
 

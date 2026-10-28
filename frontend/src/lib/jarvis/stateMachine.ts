@@ -29,17 +29,21 @@ export const VALID_TRANSITIONS: Record<
 > = {
   idle: {
     START_LISTENING: 'listening',
+    AUDIO_DETECTED: 'hearing',
+    TRANSCRIPTION_STARTED: 'transcribing',
     PAUSE: 'paused',
     FAIL: 'error',
   },
   listening: {
     AUDIO_DETECTED: 'hearing',
+    RESPONSE_STARTED: 'speaking',
     STOP_LISTENING: 'idle',
     TRANSCRIPTION_STARTED: 'transcribing',
     PAUSE: 'paused',
     FAIL: 'error',
   },
   hearing: {
+    RESPONSE_STARTED: 'speaking',
     STOP_LISTENING: 'idle',
     TRANSCRIPTION_STARTED: 'transcribing',
     PAUSE: 'paused',
@@ -59,6 +63,7 @@ export const VALID_TRANSITIONS: Record<
     FAIL: 'error',
   },
   speaking: {
+    AUDIO_DETECTED: 'hearing',
     RESPONSE_COMPLETED: 'idle',
     PAUSE: 'paused',
     STOP_LISTENING: 'idle',

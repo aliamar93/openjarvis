@@ -6,7 +6,20 @@ export interface VadOptions {
   silenceMs?: number;
   minimumSpeechMs?: number;
   maximumSpeechMs?: number;
+  thresholdMultiplier?: number;
+  thresholdOverride?: number;
 }
+
+export interface VadDiagnostics {
+  noiseFloor: number;
+  threshold: number;
+  aboveThresholdMs: number;
+  active: boolean;
+}
+
+export const SPEAKING_VAD_THRESHOLD_BOOST = 1.25;
+export const SPEAKING_VAD_MIN_THRESHOLD = 0.004;
+export const SPEAKING_VAD_MAX_THRESHOLD = 0.024;
 
 export class EnergyVad {
   private noiseFloor = 0.004;
@@ -14,10 +27,43 @@ export class EnergyVad {
   private aboveThresholdMs = 0;
   private silenceMs = 0;
   private speechDurationMs = 0;
+  private lastThreshold = 0;
+
+  get diagnostics(): VadDiagnostics {
+    return {
+      noiseFloor: this.noiseFloor,
+      threshold: this.lastThreshold,
+      aboveThresholdMs: this.aboveThresholdMs,
+      active: this.active,
+    };
+  }
+
+  thresholdFor(sensitivity = 0.5, thresholdMultiplier = 1): number {
+    const safeSensitivity = Math.min(1, Math.max(0, sensitivity));
+    return Math.max(
+      0.002 + (1 - safeSensitivity) * 0.008,
+      this.noiseFloor * (3.2 - safeSensitivity * 1.2),
+    ) * thresholdMultiplier;
+  }
+
+  speakingThresholdFor(sensitivity = 0.5): number {
+    const normalThreshold = this.thresholdFor(sensitivity);
+    const environmentThreshold = this.noiseFloor * (3.2 - Math.min(1, Math.max(0, sensitivity)) * 1.2);
+    return Math.min(
+      SPEAKING_VAD_MAX_THRESHOLD,
+      Math.max(SPEAKING_VAD_MIN_THRESHOLD, normalThreshold * SPEAKING_VAD_THRESHOLD_BOOST, environmentThreshold),
+    );
+  }
+
+  get hasVoiceActivity(): boolean {
+    return this.active || this.aboveThresholdMs > 0;
+  }
 
   process(rms: number, frameMs: number, options: VadOptions = {}): VadEvent | null {
     const sensitivity = Math.min(1, Math.max(0, options.sensitivity ?? 0.5));
-    const threshold = Math.max(0.002 + (1 - sensitivity) * 0.008, this.noiseFloor * (3.2 - sensitivity * 1.2));
+    const threshold = options.thresholdOverride ??
+      this.thresholdFor(sensitivity, options.thresholdMultiplier ?? 1);
+    this.lastThreshold = threshold;
     const voiced = Number.isFinite(rms) && rms >= threshold;
 
     if (!this.active) {

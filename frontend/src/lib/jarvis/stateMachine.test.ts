@@ -22,6 +22,10 @@ describe('Jarvis state machine', () => {
     expect(transition('error', { type: 'RESUME' })).toBe('error');
   });
 
+  it('moves from speaking to hearing when barge-in audio is detected', () => {
+    expect(transition('speaking', { type: 'AUDIO_DETECTED' })).toBe('hearing');
+  });
+
   it('can reset an error and complete a listening-to-speaking cycle', () => {
     const events: JarvisEvent[] = [
       { type: 'FAIL' },

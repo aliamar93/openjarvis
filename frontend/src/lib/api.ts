@@ -105,6 +105,17 @@ export const authHeaders = (
   return key ? { ...extra, Authorization: `Bearer ${key}` } : { ...extra };
 };
 
+export function observeApiResponse(response: Response, path: string): Response {
+  if (
+    response.status === 401 &&
+    !path.startsWith('/auth/') &&
+    typeof window !== 'undefined'
+  ) {
+    window.dispatchEvent(new Event('openjarvis:auth-expired'));
+  }
+  return response;
+}
+
 // Centralized fetch for the local server: prepends getBase() and injects the
 // Bearer auth header (when a key is set) on every call. Using this everywhere
 // guarantees no /v1 or /api request is sent without auth — the bug in #266 was
@@ -117,7 +128,11 @@ export const apiFetch = (
   const headers = authHeaders(
     (init.headers as Record<string, string> | undefined) ?? {},
   );
-  return fetch(`${getBase()}${path}`, { ...init, headers });
+  return fetch(`${getBase()}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers,
+  }).then((response) => observeApiResponse(response, path));
 };
 
 async function tauriInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -294,9 +309,12 @@ export async function checkHealth(): Promise<boolean> {
   // worker, etc.) fall back to an arbitrary API endpoint we know the rest
   // of the app polls successfully. If THAT also fails we genuinely can't
   // reach the backend.
-  const probe = async (url: string): Promise<boolean> => {
+  const probe = async (url: string, path: string): Promise<boolean> => {
     try {
-      const res = await fetch(url, { cache: 'no-store' });
+      const res = await fetch(url, {
+        cache: 'no-store',
+        credentials: 'include',
+      }).then((response) => observeApiResponse(response, path));
       return res.ok;
     } catch {
       return false;
@@ -306,10 +324,10 @@ export async function checkHealth(): Promise<boolean> {
   // Probe the configured API base first; the relative fallback supports
   // production deployments where both are served from one origin.
   const base = getBase().replace(/\/+$/, '');
-  if (base && await probe(`${base}/health`)) return true;
-  if (await probe('/health')) return true;
-  if (base && await probe(`${base}/v1/connectors`)) return true;
-  return probe('/v1/connectors');
+  if (base && await probe(`${base}/health`, '/health')) return true;
+  if (await probe('/health', '/health')) return true;
+  if (base && await probe(`${base}/v1/connectors`, '/v1/connectors')) return true;
+  return probe('/v1/connectors', '/v1/connectors');
 }
 
 export async function fetchEnergy(): Promise<unknown> {
@@ -616,18 +634,15 @@ export async function bindAgentChannel(
   channelType: string,
   config?: Record<string, unknown>,
 ): Promise<ChannelBinding> {
-  const res = await fetch(
-    `${getBase()}/v1/managed-agents/${agentId}/channels`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        channel_type: channelType,
-        config: config || {},
-        routing_mode: 'dedicated',
-      }),
-    },
-  );
+  const res = await apiFetch(`/v1/managed-agents/${agentId}/channels`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      channel_type: channelType,
+      config: config || {},
+      routing_mode: 'dedicated',
+    }),
+  });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   return res.json();
 }
@@ -636,8 +651,8 @@ export async function unbindAgentChannel(
   agentId: string,
   bindingId: string,
 ): Promise<void> {
-  const res = await fetch(
-    `${getBase()}/v1/managed-agents/${agentId}/channels/${bindingId}`,
+  const res = await apiFetch(
+    `/v1/managed-agents/${agentId}/channels/${bindingId}`,
     { method: 'DELETE' },
   );
   if (!res.ok) throw new Error(`Failed: ${res.status}`);

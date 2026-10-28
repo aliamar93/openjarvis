@@ -5,6 +5,12 @@ import { useAppStore } from '../lib/store';
 import { useTtsStore } from '../lib/tts';
 import type { ChatMessage } from '../types';
 import { jarvisStrings } from '../lib/jarvis/strings';
+import {
+  AudioPreRollBuffer,
+  processAudioFrame,
+  shouldBlockAudioFrame,
+  SPEAKING_VAD_START_MS,
+} from '../lib/jarvis/audioFrame';
 import { EnergyVad, frameRms, pcmToWav } from '../lib/jarvis/vad';
 import { removeActivationWord, takeCompleteSentences, toSpeechText } from '../lib/jarvis/speechText';
 import {
@@ -14,6 +20,7 @@ import {
   withTranscriptionTimeout,
 } from '../lib/jarvis/transcription';
 import {
+  classifyInterruption,
   getFinalResponseSpeech,
   getRepetitionCount,
   JarvisResponseSpeaker,
@@ -38,6 +45,8 @@ export interface JarvisVoicePreferences {
   autoStart: boolean;
   pauseWhenHidden: boolean;
   thinkingTimeoutSec: number;
+  allowVoiceInterruption: boolean;
+  interruptionRequiresWakeWord: boolean;
 }
 
 interface LoadedVoicePreferences {
@@ -55,7 +64,31 @@ const DEFAULT_PREFERENCES: JarvisVoicePreferences = {
   autoStart: false,
   pauseWhenHidden: true,
   thinkingTimeoutSec: 120,
+  allowVoiceInterruption: true,
+  interruptionRequiresWakeWord: false,
 };
+
+export function mergeVoicePreferences(
+  parsed: Partial<JarvisVoicePreferences> | null | undefined = undefined,
+): JarvisVoicePreferences {
+  const saved = parsed ?? {};
+  return {
+    ...DEFAULT_PREFERENCES,
+    ...saved,
+    adapter: saved.adapter === 'server' ? 'server' : 'browser',
+    allowVoiceInterruption: saved.allowVoiceInterruption !== false,
+    interruptionRequiresWakeWord: saved.interruptionRequiresWakeWord === true,
+    speed: Math.min(2, Math.max(0.5, Number(saved.speed) || 1)),
+    sensitivity: Number.isFinite(Number(saved.sensitivity))
+      ? Math.min(1, Math.max(0, Number(saved.sensitivity)))
+      : DEFAULT_PREFERENCES.sensitivity,
+    thinkingTimeoutSec: Math.min(900, Math.max(10, Number(saved.thinkingTimeoutSec) || 120)),
+  };
+}
+
+export const BARGE_IN_START_MS = SPEAKING_VAD_START_MS;
+export const AUTO_RESUME_DELAY_MS = 750;
+export const AUDIO_DIAGNOSTIC_INTERVAL_MS = 500;
 
 interface CaptureResources {
   stream: MediaStream;
@@ -66,22 +99,13 @@ interface CaptureResources {
 }
 
 function loadPreferences(): LoadedVoicePreferences {
-  if (typeof window === 'undefined') return { preferences: DEFAULT_PREFERENCES, error: null };
+  if (typeof window === 'undefined') return { preferences: mergeVoicePreferences(), error: null };
   try {
     const raw = window.localStorage.getItem(JARVIS_VOICE_KEY);
     if (!raw) return { preferences: DEFAULT_PREFERENCES, error: null };
     const parsed = JSON.parse(raw) as Partial<JarvisVoicePreferences>;
     return {
-      preferences: {
-        ...DEFAULT_PREFERENCES,
-        ...parsed,
-        adapter: parsed.adapter === 'server' ? 'server' : 'browser',
-        speed: Math.min(2, Math.max(0.5, Number(parsed.speed) || 1)),
-        sensitivity: Number.isFinite(Number(parsed.sensitivity))
-          ? Math.min(1, Math.max(0, Number(parsed.sensitivity)))
-          : 0.5,
-        thinkingTimeoutSec: Math.min(900, Math.max(10, Number(parsed.thinkingTimeoutSec) || 120)),
-      },
+      preferences: mergeVoicePreferences(parsed),
       error: null,
     };
   } catch {
@@ -94,6 +118,18 @@ function loadPreferences(): LoadedVoicePreferences {
 
 function createId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function isBargeInDebugEnabled(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.localStorage.getItem('jarvis:debug') === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function logBargeIn(message: string, details?: object): void {
+  if (isBargeInDebugEnabled()) console.info('[BARGE-IN]', message, details ?? '');
 }
 
 function concatenate(chunks: Float32Array[]): Float32Array {
@@ -164,13 +200,14 @@ export function useJarvisVoice(): JarvisVoiceController {
   const [lastTranscript, setLastTranscript] = useState('');
 
   const captureRef = useRef<CaptureResources | null>(null);
-  const preRollRef = useRef<Float32Array[]>([]);
-  const preRollSamplesRef = useRef(0);
+  const preRollRef = useRef(new AudioPreRollBuffer());
   const segmentRef = useRef<Float32Array[] | null>(null);
   const vadRef = useRef(new EnergyVad());
   const processingRef = useRef(false);
   const failuresRef = useRef(0);
   const activeControllerRef = useRef<AbortController | null>(null);
+  const chatControllersRef = useRef(new Set<AbortController>());
+  const chatTimeoutsRef = useRef(new Map<AbortController, ReturnType<typeof setTimeout>>());
   const activeTranscriptionRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -180,17 +217,35 @@ export function useJarvisVoice(): JarvisVoiceController {
   const queueRef = useRef<SpeechQueue | null>(null);
   const responseSpeakerRef = useRef<JarvisResponseSpeaker | null>(null);
   const conversationRef = useRef<string | null>(null);
-  const processChunkRef = useRef<(chunk: Float32Array) => void>(() => undefined);
+  const processChunkRef = useRef<(chunk: Float32Array, source: 'AudioWorklet' | 'ScriptProcessor') => void>(() => undefined);
   const startRef = useRef<() => Promise<void>>(async () => undefined);
   const startTokenRef = useRef(0);
   const startPendingRef = useRef(false);
   const pauseWhenHiddenRef = useRef(false);
   const hiddenPauseRef = useRef(false);
+  const interruptionRef = useRef(false);
+  const interruptedSpeechTextRef = useRef('');
+  const ttsStartedAtRef = useRef(0);
+  const autoResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAudioDiagnosticAtRef = useRef(0);
+  const lastVadProgressLogAtRef = useRef(0);
+  const lastEchoWindowLogAtRef = useRef(0);
+  const previousAboveThresholdRef = useRef(false);
+  const loggedPreferencesRef = useRef(false);
 
   preferencesRef.current = preferences;
 
   const move = useCallback((event: JarvisEvent) => {
+    const previous = stateRef.current;
     const next = transition(stateRef.current, event);
+    if (previous === 'speaking' && event.type === 'AUDIO_DETECTED') {
+      logBargeIn('transition speaking → hearing', {
+        attempted: true,
+        accepted: next === 'hearing',
+        previous,
+        next,
+      });
+    }
     stateRef.current = next;
     setState(next);
   }, []);
@@ -227,6 +282,18 @@ export function useJarvisVoice(): JarvisVoiceController {
     }, 1400);
   }, [move]);
 
+  const abortChatRequests = useCallback(() => {
+    for (const controller of chatControllersRef.current) {
+      controller.abort();
+      const timer = chatTimeoutsRef.current.get(controller);
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    chatControllersRef.current.clear();
+    chatTimeoutsRef.current.clear();
+    activeControllerRef.current = null;
+    timeoutRef.current = null;
+  }, []);
+
   const updatePreferences = useCallback((updates: Partial<JarvisVoicePreferences>) => {
     setPreferences((current) => {
       const next = { ...current, ...updates };
@@ -252,16 +319,70 @@ export function useJarvisVoice(): JarvisVoiceController {
   const finishListeningDelay = useCallback(() => {
     if (resumeTimerRef.current !== null) clearTimeout(resumeTimerRef.current);
     resumeTimerRef.current = setTimeout(() => {
+      if (interruptionRef.current) return;
       if (stateRef.current === 'speaking') move({ type: 'RESPONSE_COMPLETED' });
       if (stateRef.current === 'thinking') move({ type: 'RESPONSE_COMPLETED' });
       if (stateRef.current === 'idle' && captureRef.current) move({ type: 'START_LISTENING' });
       processingRef.current = false;
-      vadRef.current.reset();
-      segmentRef.current = null;
-      preRollRef.current = [];
-      preRollSamplesRef.current = 0;
+      const speakingThreshold = vadRef.current.thresholdFor(preferencesRef.current.sensitivity);
+      const hasBufferedVoice = preRollRef.current.hasAboveThreshold(speakingThreshold * 0.7);
+      if (
+        !vadRef.current.hasVoiceActivity &&
+        !hasBufferedVoice &&
+        stateRef.current !== 'hearing' &&
+        stateRef.current !== 'transcribing'
+      ) {
+        vadRef.current.reset();
+        segmentRef.current = null;
+        preRollRef.current.clear();
+      } else {
+        logBargeIn('preserving active user audio after TTS completion', {
+          state: stateRef.current,
+          vad: vadRef.current.diagnostics,
+          bufferedSamples: preRollRef.current.sampleCount,
+          segmentSamples: segmentRef.current?.reduce((total, chunk) => total + chunk.length, 0) ?? 0,
+          hasBufferedVoice,
+        });
+      }
     }, 300);
   }, [move]);
+
+  const resumeParkedResponse = useCallback(async () => {
+    if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+    autoResumeTimerRef.current = null;
+    const speaker = responseSpeakerRef.current;
+    const resumed = speaker?.resumeLatest();
+    interruptionRef.current = false;
+    interruptedSpeechTextRef.current = '';
+    segmentRef.current = null;
+    preRollRef.current.clear();
+    vadRef.current.reset();
+    if (!resumed) {
+      processingRef.current = false;
+      if (stateRef.current === 'transcribing') move({ type: 'STOP_LISTENING' });
+      if (stateRef.current === 'hearing') move({ type: 'STOP_LISTENING' });
+      if (stateRef.current === 'idle' && captureRef.current) move({ type: 'START_LISTENING' });
+      return;
+    }
+
+    if (stateRef.current === 'transcribing') move({ type: 'TRANSCRIPTION_COMPLETED' });
+    if (stateRef.current === 'hearing') move({ type: 'STOP_LISTENING' });
+    if (stateRef.current === 'idle' && captureRef.current) move({ type: 'START_LISTENING' });
+    setError(null);
+    await queueRef.current?.whenIdle();
+    if (resumed.complete) {
+      speaker?.completeResponse(resumed.responseId, resumed.fullText);
+      finishListeningDelay();
+    }
+  }, [finishListeningDelay, move]);
+
+  const scheduleAutomaticResume = useCallback(() => {
+    if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+    autoResumeTimerRef.current = setTimeout(() => {
+      autoResumeTimerRef.current = null;
+      void resumeParkedResponse();
+    }, AUTO_RESUME_DELAY_MS);
+  }, [resumeParkedResponse]);
 
   const runChat = useCallback(async (text: string, requestId: number) => {
     const model = useAppStore.getState().selectedModel;
@@ -296,11 +417,14 @@ export function useJarvisVoice(): JarvisVoiceController {
     const current = useAppStore.getState();
     const controller = new AbortController();
     activeControllerRef.current = controller;
+    chatControllersRef.current.add(controller);
     let timedOut = false;
-    timeoutRef.current = setTimeout(() => {
+    const requestTimer = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, preferencesRef.current.thinkingTimeoutSec * 1000);
+    chatTimeoutsRef.current.set(controller, requestTimer);
+    timeoutRef.current = requestTimer;
 
     processingRef.current = true;
     move({ type: 'TRANSCRIPTION_COMPLETED' });
@@ -332,7 +456,6 @@ export function useJarvisVoice(): JarvisVoiceController {
         temperature,
         max_tokens: maxTokens,
       }, controller.signal)) {
-        if (requestId !== requestIdRef.current) return;
         if (event.event === 'error') throw new Error('O chat não conseguiu responder.');
         const payload = JSON.parse(event.data) as {
           choices?: Array<{ delta?: { content?: string | Array<{ text?: string }> } }>;
@@ -346,22 +469,27 @@ export function useJarvisVoice(): JarvisVoiceController {
         if (!delta) continue;
         response += delta;
         pendingSpeech += delta;
+        responseSpeakerRef.current?.updateResponseText(responseId, response);
         const complete = takeCompleteSentences(pendingSpeech);
         pendingSpeech = complete.remainder;
         for (const sentence of complete.sentences) speakResponse(sentence);
-        useAppStore.getState().updateLastAssistant(conversationId, response);
+        useAppStore.getState().updateMessageContent(conversationId, assistant.id, response);
       }
 
-      if (requestId !== requestIdRef.current) return;
       const finalContent = response || 'Não consegui gerar uma resposta.';
       const finalSpeech = getFinalResponseSpeech(response, pendingSpeech);
       if (finalSpeech) speakResponse(toSpeechText(finalSpeech));
-      useAppStore.getState().updateLastAssistant(conversationId, finalContent);
+      responseSpeakerRef.current?.updateResponseText(responseId, finalContent);
+      useAppStore.getState().updateMessageContent(conversationId, assistant.id, finalContent);
       await queueRef.current?.whenIdle();
       if (queuedSpeech) responseSpeakerRef.current?.completeResponse(responseId, finalContent);
-      failuresRef.current = 0;
-      setError(null);
-      finishListeningDelay();
+      if (requestId === requestIdRef.current && !interruptionRef.current) {
+        failuresRef.current = 0;
+        setError(null);
+        finishListeningDelay();
+      } else if (responseSpeakerRef.current?.isActiveResponse(responseId)) {
+        finishListeningDelay();
+      }
     } catch (caught) {
       if (requestId !== requestIdRef.current) return;
       if (controller.signal.aborted && !timedOut) {
@@ -374,28 +502,104 @@ export function useJarvisVoice(): JarvisVoiceController {
           ? 'Não foi possível conectar ao servidor. Verifique se o backend está ativo.'
           : 'Falha ao conversar com o modelo. Tente novamente.');
     } finally {
-      if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
+      clearTimeout(requestTimer);
+      chatTimeoutsRef.current.delete(controller);
+      chatControllersRef.current.delete(controller);
+      if (timeoutRef.current === requestTimer) timeoutRef.current = null;
       if (activeControllerRef.current === controller) activeControllerRef.current = null;
+      if (responseSpeakerRef.current?.isParkedResponse(responseId)) {
+        responseSpeakerRef.current.completeResponse(responseId, response || 'Não consegui gerar uma resposta.');
+      }
     }
   }, [finishListeningDelay, move]);
 
   const processTranscript = useCallback(async (transcript: string, fromSpeech = true) => {
     let text = transcript.trim();
+    const wasInterrupted = fromSpeech && interruptionRef.current;
+    if (
+      fromSpeech &&
+      !wasInterrupted &&
+      responseSpeakerRef.current?.hasParkedResponse
+    ) {
+      let commandText = text;
+      let wakeWordSatisfied = !preferencesRef.current.wakeWord;
+      if (preferencesRef.current.wakeWord) {
+        const activatedText = removeActivationWord(commandText);
+        if (activatedText !== null) {
+          commandText = activatedText;
+          wakeWordSatisfied = true;
+        }
+      }
+      if (wakeWordSatisfied && classifyInterruption(commandText).type === 'resume') {
+        await resumeParkedResponse();
+        return;
+      }
+    }
+
+    if (wasInterrupted) {
+      if (preferencesRef.current.interruptionRequiresWakeWord) {
+        const activatedText = removeActivationWord(text);
+        if (activatedText === null) {
+          scheduleAutomaticResume();
+          return;
+        }
+        text = activatedText;
+      } else {
+        const activationText = removeActivationWord(text);
+        if (activationText !== null) text = activationText;
+      }
+
+      const intent = classifyInterruption(text, interruptedSpeechTextRef.current);
+      if (intent.type === 'noise' || intent.type === 'echo') {
+        scheduleAutomaticResume();
+        return;
+      }
+      if (intent.type === 'stop') {
+        interruptionRef.current = false;
+        interruptedSpeechTextRef.current = '';
+        processingRef.current = false;
+        segmentRef.current = null;
+        preRollRef.current.clear();
+        vadRef.current.reset();
+        if (stateRef.current === 'transcribing') move({ type: 'STOP_LISTENING' });
+        if (stateRef.current === 'idle' && captureRef.current) move({ type: 'START_LISTENING' });
+        return;
+      }
+      if (intent.type === 'resume') {
+        await resumeParkedResponse();
+        return;
+      }
+      if (intent.type === 'repeat') {
+        text = `repita ${intent.count} vezes`;
+      } else {
+        responseSpeakerRef.current?.finalizeLatestParkedResponse();
+      }
+      interruptionRef.current = false;
+      interruptedSpeechTextRef.current = '';
+    }
+
     if (fromSpeech && preferencesRef.current.wakeWord) {
       const activatedText = removeActivationWord(text);
       if (activatedText === null) {
         processingRef.current = false;
-        move({ type: 'STOP_LISTENING' });
-        finishListeningDelay();
+        if (wasInterrupted) {
+          scheduleAutomaticResume();
+        } else {
+          move({ type: 'STOP_LISTENING' });
+          finishListeningDelay();
+        }
         return;
       }
       text = activatedText;
     }
     if (text.length < 2) {
       processingRef.current = false;
-      move({ type: 'STOP_LISTENING' });
-      finishListeningDelay();
+      if (wasInterrupted) {
+        scheduleAutomaticResume();
+      } else {
+        move({ type: 'STOP_LISTENING' });
+        finishListeningDelay();
+      }
       return;
     }
     if (fromSpeech && preferencesRef.current.captions) setLastTranscript(transcript);
@@ -429,40 +633,147 @@ export function useJarvisVoice(): JarvisVoiceController {
     }
   }, [finishListeningDelay, move, runChat, setFailure]);
 
-  const processAudioChunk = useCallback((chunk: Float32Array) => {
+  const processAudioChunk = useCallback((
+    chunk: Float32Array,
+    source: 'AudioWorklet' | 'ScriptProcessor',
+  ) => {
     if (!captureRef.current) {
       setAmplitude(0);
       return;
     }
-    if (processingRef.current || stateRef.current === 'paused' || stateRef.current === 'error') return;
+    const state = stateRef.current;
+    const speaking = state === 'speaking';
     const sampleRate = captureRef.current.context.sampleRate;
-    const frameMs = (chunk.length / sampleRate) * 1000;
-    const rms = frameRms(chunk);
-    setAmplitude(rms * 5);
-
+    const preference = preferencesRef.current;
+    const rawRms = frameRms(chunk);
     if (!segmentRef.current) {
-      const copy = chunk.slice();
-      preRollRef.current.push(copy);
-      preRollSamplesRef.current += copy.length;
       const maxSamples = Math.round(sampleRate * 0.3);
-      while (preRollSamplesRef.current > maxSamples && preRollRef.current.length > 0) {
-        const removed = preRollRef.current.shift();
-        if (removed) preRollSamplesRef.current -= removed.length;
-      }
+      preRollRef.current.push(chunk, maxSamples);
     } else {
       segmentRef.current.push(chunk.slice());
     }
+    setAmplitude(rawRms * 5);
 
-    const event = vadRef.current.process(rms, frameMs, {
-      sensitivity: preferencesRef.current.sensitivity,
-      maximumSpeechMs: 29_700,
+    const isBlockedByProcessing = shouldBlockAudioFrame(state, processingRef.current);
+    const blockedReason = isBlockedByProcessing
+      ? 'processing-guard'
+      : null;
+    const effectiveThreshold = speaking
+      ? vadRef.current.speakingThresholdFor(preference.sensitivity)
+      : vadRef.current.thresholdFor(preference.sensitivity);
+    const now = Date.now();
+    const shouldLogAudio = now - lastAudioDiagnosticAtRef.current >= AUDIO_DIAGNOSTIC_INTERVAL_MS;
+    if (isBlockedByProcessing) {
+      if (shouldLogAudio) {
+        lastAudioDiagnosticAtRef.current = now;
+        logBargeIn('audio block', {
+          source,
+          state,
+          allowVoiceInterruption: preference.allowVoiceInterruption,
+          rms: Number(rawRms.toFixed(5)),
+          threshold: Number(effectiveThreshold.toFixed(5)),
+          noiseFloor: Number(vadRef.current.diagnostics.noiseFloor.toFixed(5)),
+          aboveThresholdMs: Number(vadRef.current.diagnostics.aboveThresholdMs.toFixed(0)),
+          vad: 'discarded',
+          reason: blockedReason,
+        });
+      }
+      return;
+    }
+
+    const rms = processAudioFrame(vadRef.current, chunk, sampleRate, {
+      state,
+      allowVoiceInterruption: preference.allowVoiceInterruption,
+      sensitivity: preference.sensitivity,
+      elapsedSinceTtsStartMs: Date.now() - ttsStartedAtRef.current,
     });
+    const effectiveReason = rms.disposition === 'sent-to-vad'
+      ? rawRms >= rms.threshold ? 'above-threshold' : 'below-threshold'
+      : rms.disposition;
+    if (shouldLogAudio) {
+      lastAudioDiagnosticAtRef.current = now;
+      logBargeIn('audio block', {
+        source,
+        state,
+        allowVoiceInterruption: preference.allowVoiceInterruption,
+        rms: Number(rms.rms.toFixed(5)),
+        threshold: Number(rms.threshold.toFixed(5)),
+        noiseFloor: Number(vadRef.current.diagnostics.noiseFloor.toFixed(5)),
+        aboveThresholdMs: Number(rms.aboveThresholdMs.toFixed(0)),
+        vad: rms.disposition === 'sent-to-vad' ? 'processed' : 'discarded',
+        reason: effectiveReason,
+      });
+    }
+
+    if (rms.disposition !== 'sent-to-vad') {
+      if (
+        rms.disposition === 'echo-window' &&
+        rms.rms >= rms.threshold &&
+        now - lastEchoWindowLogAtRef.current >= AUDIO_DIAGNOSTIC_INTERVAL_MS
+      ) {
+        lastEchoWindowLogAtRef.current = now;
+        logBargeIn('voice-like RMS ignored during initial TTS echo window', {
+          rms: Number(rms.rms.toFixed(5)),
+          threshold: Number(rms.threshold.toFixed(5)),
+          elapsedSinceTtsStartMs: Date.now() - ttsStartedAtRef.current,
+          reason: 'echo-window',
+        });
+      }
+      return;
+    }
+
+    const event = rms.event;
+    if (rms.rms >= rms.threshold) {
+      if (!previousAboveThresholdRef.current) {
+        logBargeIn('RMS crossed the effective threshold', {
+          rms: Number(rms.rms.toFixed(5)),
+          threshold: Number(rms.threshold.toFixed(5)),
+          noiseFloor: Number(vadRef.current.diagnostics.noiseFloor.toFixed(5)),
+          accumulatedAboveThresholdMs: Number(rms.aboveThresholdMs.toFixed(0)),
+          vadActive: vadRef.current.diagnostics.active,
+        });
+      }
+      if (speaking && now - lastVadProgressLogAtRef.current >= AUDIO_DIAGNOSTIC_INTERVAL_MS) {
+        lastVadProgressLogAtRef.current = now;
+        logBargeIn('barge-in not fired yet', {
+          durationAboveThresholdMs: Number(rms.aboveThresholdMs.toFixed(0)),
+          requiredMs: BARGE_IN_START_MS,
+          rms: Number(rms.rms.toFixed(5)),
+          threshold: Number(rms.threshold.toFixed(5)),
+          noiseFloor: Number(vadRef.current.diagnostics.noiseFloor.toFixed(5)),
+        });
+      }
+      previousAboveThresholdRef.current = true;
+    } else {
+      previousAboveThresholdRef.current = false;
+    }
     if (event === 'speech-start') {
-      segmentRef.current = preRollRef.current.map((buffer) => buffer.slice());
-      preRollRef.current = [];
-      preRollSamplesRef.current = 0;
+      segmentRef.current = preRollRef.current.snapshot();
+      preRollRef.current.clear();
+      if (speaking) {
+        logBargeIn('barge-in fired; parking speech and starting user capture', {
+          durationAboveThresholdMs: BARGE_IN_START_MS,
+          rms: Number(rms.rms.toFixed(5)),
+          threshold: Number(rms.threshold.toFixed(5)),
+          noiseFloor: Number(vadRef.current.diagnostics.noiseFloor.toFixed(5)),
+        });
+        const speaker = responseSpeakerRef.current;
+        interruptedSpeechTextRef.current = speaker?.currentSpeechText ?? '';
+        interruptionRef.current = speaker?.parkCurrentResponse() ?? false;
+        if (!interruptionRef.current) {
+          logBargeIn('barge-in detected but no active/parked response was available');
+          return;
+        }
+        if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+        autoResumeTimerRef.current = null;
+        processingRef.current = true;
+      }
       move({ type: 'AUDIO_DETECTED' });
     } else if (event === 'speech-end' || event === 'max-duration') {
+      logBargeIn('VAD ended user segment', {
+        event,
+        segmentSamples: segmentRef.current?.reduce((total, samples) => total + samples.length, 0) ?? 0,
+      });
       const recorded = segmentRef.current;
       segmentRef.current = null;
       if (!recorded?.length) {
@@ -474,6 +785,11 @@ export function useJarvisVoice(): JarvisVoiceController {
       processingRef.current = true;
       setAmplitude(0);
       const wav = pcmToWav(concatenate(recorded), sampleRate);
+      logBargeIn('audio segment dispatched to transcription', {
+        samples: recorded.reduce((total, samples) => total + samples.length, 0),
+        sampleRate,
+        interruptedResponse: interruptionRef.current,
+      });
       const transcriptionId = ++requestIdRef.current;
       const transcriptionController = new AbortController();
       activeTranscriptionRef.current = transcriptionController;
@@ -486,7 +802,16 @@ export function useJarvisVoice(): JarvisVoiceController {
         .then((result) => {
           if (requestIdRef.current === transcriptionId && stateRef.current === 'transcribing') {
             const transcript = result.text;
+            logBargeIn('transcription completed', {
+              usable: isUsableTranscription(transcript),
+              characters: transcript.trim().length,
+              interruptedResponse: interruptionRef.current,
+            });
             if (!isUsableTranscription(transcript)) {
+              if (interruptionRef.current) {
+                scheduleAutomaticResume();
+                return;
+              }
               processingRef.current = false;
               move({ type: 'STOP_LISTENING' });
               finishListeningDelay();
@@ -497,6 +822,11 @@ export function useJarvisVoice(): JarvisVoiceController {
         })
         .catch((caught: unknown) => {
           if (requestIdRef.current !== transcriptionId) return;
+          if (interruptionRef.current) {
+            setError('Não entendi a interrupção; vou retomar a resposta.');
+            scheduleAutomaticResume();
+            return;
+          }
           setFailure(caught instanceof TranscriptionTimeoutError
             ? 'A transcrição demorou mais que o esperado. Tente novamente.'
             : caught instanceof Error && /failed to fetch|fetch failed|networkerror|network request failed|(?:502|503|504)/i.test(caught.message)
@@ -509,11 +839,36 @@ export function useJarvisVoice(): JarvisVoiceController {
           }
         });
     } else if (event === 'speech-discard') {
+      logBargeIn('VAD did not dispatch transcription: segment was below minimum duration', {
+        minimumSpeechMs: 300,
+        diagnostics: vadRef.current.diagnostics,
+      });
       segmentRef.current = null;
+      if (interruptionRef.current) {
+        scheduleAutomaticResume();
+        return;
+      }
       if (stateRef.current === 'hearing') move({ type: 'STOP_LISTENING' });
       if (stateRef.current === 'idle' && captureRef.current) move({ type: 'START_LISTENING' });
+    } else if (speaking && rms.aboveThresholdMs > 0) {
+      if (now - lastVadProgressLogAtRef.current >= AUDIO_DIAGNOSTIC_INTERVAL_MS) {
+        lastVadProgressLogAtRef.current = now;
+        logBargeIn('barge-in not fired yet', {
+          durationAboveThresholdMs: Number(rms.aboveThresholdMs.toFixed(0)),
+          requiredMs: BARGE_IN_START_MS,
+          rms: Number(rms.rms.toFixed(5)),
+          threshold: Number(rms.threshold.toFixed(5)),
+        });
+      }
     }
-  }, [finishListeningDelay, move, processTranscript, setAmplitude, setFailure]);
+  }, [
+    finishListeningDelay,
+    move,
+    processTranscript,
+    scheduleAutomaticResume,
+    setAmplitude,
+    setFailure,
+  ]);
 
   processChunkRef.current = processAudioChunk;
 
@@ -552,10 +907,11 @@ export function useJarvisVoice(): JarvisVoiceController {
       silentGain.connect(context.destination);
 
       if ('port' in processor) {
-        processor.port.onmessage = (event: MessageEvent<Float32Array>) => processChunkRef.current(event.data);
+        processor.port.onmessage = (event: MessageEvent<Float32Array>) =>
+          processChunkRef.current(event.data, 'AudioWorklet');
       } else {
         processor.onaudioprocess = (event: AudioProcessingEvent) => {
-          processChunkRef.current(event.inputBuffer.getChannelData(0));
+          processChunkRef.current(event.inputBuffer.getChannelData(0), 'ScriptProcessor');
         };
       }
       captureRef.current = { stream, context, source, processor, silentGain };
@@ -592,20 +948,21 @@ export function useJarvisVoice(): JarvisVoiceController {
   startRef.current = start;
 
   const pause = useCallback(() => {
+    if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+    autoResumeTimerRef.current = null;
+    interruptionRef.current = false;
     startTokenRef.current += 1;
     startPendingRef.current = false;
     requestIdRef.current += 1;
-    activeControllerRef.current?.abort();
-    activeControllerRef.current = null;
+    abortChatRequests();
     activeTranscriptionRef.current?.abort();
     activeTranscriptionRef.current = null;
-    if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
     responseSpeakerRef.current?.cancel();
     processingRef.current = false;
     segmentRef.current = null;
     teardownCapture();
     move({ type: 'PAUSE' });
-  }, [move, teardownCapture]);
+  }, [abortChatRequests, move, teardownCapture]);
 
   const resume = useCallback(async () => {
     if (stateRef.current === 'paused' || stateRef.current === 'idle') {
@@ -615,14 +972,15 @@ export function useJarvisVoice(): JarvisVoiceController {
   }, [move, start]);
 
   const stop = useCallback(() => {
+    if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+    autoResumeTimerRef.current = null;
+    interruptionRef.current = false;
     startTokenRef.current += 1;
     startPendingRef.current = false;
     requestIdRef.current += 1;
-    activeControllerRef.current?.abort();
-    activeControllerRef.current = null;
+    abortChatRequests();
     activeTranscriptionRef.current?.abort();
     activeTranscriptionRef.current = null;
-    if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
     responseSpeakerRef.current?.cancel();
     processingRef.current = false;
     segmentRef.current = null;
@@ -631,17 +989,18 @@ export function useJarvisVoice(): JarvisVoiceController {
     if (errorTimerRef.current !== null) clearTimeout(errorTimerRef.current);
     move({ type: 'STOP_LISTENING' });
     setAmplitude(0);
-  }, [move, setAmplitude, teardownCapture]);
+  }, [abortChatRequests, move, setAmplitude, teardownCapture]);
 
   const interrupt = useCallback(() => {
+    if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
+    autoResumeTimerRef.current = null;
+    interruptionRef.current = false;
     startTokenRef.current += 1;
     startPendingRef.current = false;
     requestIdRef.current += 1;
-    activeControllerRef.current?.abort();
-    activeControllerRef.current = null;
+    abortChatRequests();
     activeTranscriptionRef.current?.abort();
     activeTranscriptionRef.current = null;
-    if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
     responseSpeakerRef.current?.cancel();
     segmentRef.current = null;
     setAmplitude(0);
@@ -655,7 +1014,7 @@ export function useJarvisVoice(): JarvisVoiceController {
     } else {
       processingRef.current = false;
     }
-  }, [finishListeningDelay, move, setAmplitude]);
+  }, [abortChatRequests, finishListeningDelay, move, setAmplitude]);
 
   const sendText = useCallback(async (text: string) => {
     const content = text.trim();
@@ -689,10 +1048,19 @@ export function useJarvisVoice(): JarvisVoiceController {
     responseSpeakerRef.current = responseSpeaker;
     const unsubscribe = adapter.subscribe((event) => {
       if (event.type === 'amplitude') setAmplitude(event.value);
-      if (event.type === 'start') move({ type: 'RESPONSE_STARTED' });
+      if (event.type === 'start') {
+        ttsStartedAtRef.current = Date.now();
+        logBargeIn('TTS start', {
+          stateBeforeTransition: stateRef.current,
+          allowVoiceInterruption: preferencesRef.current.allowVoiceInterruption,
+        });
+        move({ type: 'RESPONSE_STARTED' });
+      }
     });
-    if (preferences.autoStart) void startRef.current();
-
+    if (!loggedPreferencesRef.current) {
+      loggedPreferencesRef.current = true;
+      logBargeIn('effective voice preferences at session start', preferencesRef.current);
+    }
     return () => {
       unsubscribe();
       responseSpeaker.cancel();
@@ -700,7 +1068,11 @@ export function useJarvisVoice(): JarvisVoiceController {
       if (responseSpeakerRef.current === responseSpeaker) responseSpeakerRef.current = null;
       if (queueRef.current === queue) queueRef.current = null;
     };
-  }, [move, preferences.adapter, preferences.autoStart, setAmplitude]);
+  }, [move, preferences.adapter, setAmplitude]);
+
+  useEffect(() => {
+    if (preferences.autoStart) void startRef.current();
+  }, [preferences.autoStart]);
 
   useEffect(() => {
     useTtsStore.getState().stop();
@@ -730,19 +1102,20 @@ export function useJarvisVoice(): JarvisVoiceController {
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('keydown', onKeyDown);
       if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
+      if (autoResumeTimerRef.current !== null) clearTimeout(autoResumeTimerRef.current);
       if (resumeTimerRef.current !== null) clearTimeout(resumeTimerRef.current);
       if (errorTimerRef.current !== null) clearTimeout(errorTimerRef.current);
       startTokenRef.current += 1;
       startPendingRef.current = false;
       requestIdRef.current += 1;
-      activeControllerRef.current?.abort();
+      abortChatRequests();
       activeTranscriptionRef.current?.abort();
       activeTranscriptionRef.current = null;
       responseSpeakerRef.current?.cancel();
       teardownCapture();
       setAmplitude(0);
     };
-  }, [interrupt, pause, resume, setAmplitude, teardownCapture]);
+  }, [abortChatRequests, interrupt, pause, resume, setAmplitude, teardownCapture]);
 
   return {
     state,

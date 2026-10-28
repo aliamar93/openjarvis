@@ -22,6 +22,22 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")
 
+_SESSION_TOKEN = "test-session"
+_TEST_USER = {"id": "test-user", "name": "Test", "role": "admin"}
+
+
+class _SessionStore:
+    def get_user_for_token(self, token):
+        return _TEST_USER if token == _SESSION_TOKEN else None
+
+
+def _client(app):
+    from openjarvis.server.auth_store import SESSION_COOKIE_NAME
+
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE_NAME, _SESSION_TOKEN)
+    return client
+
 
 @pytest.fixture
 def event_bus():
@@ -33,6 +49,7 @@ def app(event_bus):
     from openjarvis.server.ws_bridge import create_ws_router
 
     app = FastAPI()
+    app.state.auth_store = _SessionStore()
     router = create_ws_router(event_bus)
     app.include_router(router)
     return app
@@ -40,7 +57,7 @@ def app(event_bus):
 
 class TestWSBridge:
     def test_websocket_receives_events(self, app, event_bus):
-        client = TestClient(app)
+        client = _client(app)
         with client.websocket_connect("/v1/agents/events") as ws:
             event_bus.publish(
                 EventType.AGENT_TICK_START,
@@ -55,7 +72,7 @@ class TestWSBridge:
             assert data["data"]["agent_id"] == "test-123"
 
     def test_websocket_filters_by_agent_id(self, app, event_bus):
-        client = TestClient(app)
+        client = _client(app)
         with client.websocket_connect("/v1/agents/events?agent_id=agent-A") as ws:
             # This event should NOT be received (different agent)
             event_bus.publish(EventType.AGENT_TICK_START, {"agent_id": "agent-B"})
@@ -70,9 +87,12 @@ class TestWSBridge:
             from openjarvis.server.ws_bridge import create_ws_router
 
             class FakeWebSocket:
-                app = SimpleNamespace(state=SimpleNamespace(api_key=""))
+                app = SimpleNamespace(
+                    state=SimpleNamespace(api_key="", auth_store=_SessionStore())
+                )
                 query_params = {}
                 headers = {}
+                cookies = {"openjarvis_session": _SESSION_TOKEN}
 
                 async def accept(self, subprotocol=None):
                     pass
@@ -91,9 +111,12 @@ class TestWSBridge:
 
             class FakeWebSocket:
                 def __init__(self):
-                    self.app = SimpleNamespace(state=SimpleNamespace(api_key=""))
+                    self.app = SimpleNamespace(
+                        state=SimpleNamespace(api_key="", auth_store=_SessionStore())
+                    )
                     self.query_params = {}
                     self.headers = {}
+                    self.cookies = {"openjarvis_session": _SESSION_TOKEN}
                     self.sent = []
                     self.receive_count = 0
                     self.disconnect = asyncio.Event()
@@ -130,9 +153,12 @@ class TestWSBridge:
 
             class FakeWebSocket:
                 def __init__(self):
-                    self.app = SimpleNamespace(state=SimpleNamespace(api_key=""))
+                    self.app = SimpleNamespace(
+                        state=SimpleNamespace(api_key="", auth_store=_SessionStore())
+                    )
                     self.query_params = {}
                     self.headers = {}
+                    self.cookies = {"openjarvis_session": _SESSION_TOKEN}
                     self.receiving = asyncio.Event()
                     self.receive_cancelled = asyncio.Event()
 
@@ -178,10 +204,11 @@ class TestIncludeAllRoutesBusWiring:
         reset_event_bus()  # isolate from other tests' global singleton state
         app = FastAPI()
         real_bus = EventBus()
+        app.state.auth_store = _SessionStore()
         app.state.bus = real_bus
         include_all_routes(app)
 
-        client = TestClient(app)
+        client = _client(app)
         with client.websocket_connect("/v1/agents/events") as ws:
             real_bus.publish(EventType.AGENT_TICK_START, {"agent_id": "test-123"})
             time.sleep(0.05)
@@ -220,6 +247,7 @@ class TestIncludeAllRoutesBusWiring:
         }
 
         app = FastAPI()
+        app.state.auth_store = _SessionStore()
         app.state.bus = app_bus
         app.state.agent_manager = manager
         include_all_routes(app)
@@ -232,7 +260,7 @@ class TestIncludeAllRoutesBusWiring:
             executor._bus.publish(EventType.AGENT_TICK_START, {"agent_id": agent_id})
             executed.set()
 
-        client = TestClient(app)
+        client = _client(app)
         with (
             patch.object(AgentExecutor, "execute_tick", publish_tick),
             patch(

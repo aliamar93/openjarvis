@@ -218,6 +218,7 @@ export function createTtsAdapter(kind: TtsAdapterKind): TtsAdapter {
 export class SpeechQueue {
   private items: string[] = [];
   private running = false;
+  private activeText: string | null = null;
   private idleWaiters: Array<() => void> = [];
 
   constructor(
@@ -239,6 +240,21 @@ export class SpeechQueue {
     this.finishIfIdle();
   }
 
+  get currentText(): string | null {
+    return this.activeText;
+  }
+
+  park(): string[] {
+    const pending = [
+      ...(this.activeText ? [this.activeText] : []),
+      ...this.items,
+    ];
+    this.items = [];
+    this.adapter.cancel();
+    this.finishIfIdle();
+    return pending;
+  }
+
   whenIdle(): Promise<void> {
     if (!this.running && this.items.length === 0) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));
@@ -251,11 +267,14 @@ export class SpeechQueue {
       while (this.items.length > 0) {
         const text = this.items.shift();
         if (!text) continue;
+        this.activeText = text;
         try {
           await this.adapter.speak(text, this.options());
         } catch (caught) {
           if (caught instanceof DOMException && caught.name === 'AbortError') continue;
           this.onError(caught instanceof Error ? caught : new Error('Falha na síntese de voz.'));
+        } finally {
+          this.activeText = null;
         }
       }
     } finally {

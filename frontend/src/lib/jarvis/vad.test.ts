@@ -37,6 +37,24 @@ describe('Jarvis voice activity detection', () => {
     }
     expect(result).toBe('max-duration');
   });
+
+  it('uses a stronger threshold during speaking to suppress acoustic echo', () => {
+    const regular = new EnergyVad();
+    const guarded = new EnergyVad();
+    const regularEvents = [];
+    const guardedEvents = [];
+    for (let frame = 0; frame < 10; frame += 1) {
+      regularEvents.push(regular.process(0.012, 20, { sensitivity: 0.5 }));
+      guardedEvents.push(guarded.process(0.012, 20, {
+        sensitivity: 0.15,
+        startMs: 180,
+        thresholdMultiplier: 1.8,
+      }));
+    }
+
+    expect(regularEvents).toContain('speech-start');
+    expect(guardedEvents).not.toContain('speech-start');
+  });
 });
 
 describe('PCM WAV encoding', () => {

@@ -15,6 +15,7 @@ import type {
   TokenUsage,
 } from '../types';
 import type { ManagedAgent } from './api';
+import { apiFetch } from './api';
 import { isEmbedOnlyModel } from './model-capabilities';
 import { serializeToolCallArguments } from './tool-call';
 
@@ -41,6 +42,11 @@ const OPTIN_NAME_KEY = 'openjarvis-display-name';
 const OPTIN_EMAIL_KEY = 'openjarvis-email';
 const OPTIN_ANONID_KEY = 'openjarvis-anon-id';
 const OPTIN_SEEN_KEY = 'openjarvis-optin-seen';
+const USER_CONVERSATIONS_PREFIX = `${CONVERSATIONS_KEY}:`;
+let activeUserId: string | null = null;
+const conversationSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const pendingConversationSyncs = new Map<string, Conversation>();
+const activeConversationSyncs = new Map<string, Promise<void>>();
 
 interface ConversationStore {
   version: 1;
@@ -60,9 +66,13 @@ function readLocalStorage(key: string): string | null {
   }
 }
 
-function loadConversations(): ConversationStore {
+function conversationStorageKey(userId = activeUserId): string {
+  return userId ? `${USER_CONVERSATIONS_PREFIX}${userId}` : CONVERSATIONS_KEY;
+}
+
+function loadConversations(key = conversationStorageKey()): ConversationStore {
   try {
-    const raw = localStorage.getItem(CONVERSATIONS_KEY);
+    const raw = localStorage.getItem(key);
     if (!raw) return { version: 1, conversations: {}, activeId: null };
     const parsed = JSON.parse(raw);
     if (parsed.version === 1) {
@@ -80,7 +90,7 @@ function loadConversations(): ConversationStore {
       }
       if (repaired) {
         try {
-          localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(parsed));
+          localStorage.setItem(key, JSON.stringify(parsed));
         } catch {
           // Keep the repaired conversations usable in memory when storage is
           // read-only or full. A failed best-effort writeback must not make
@@ -95,8 +105,97 @@ function loadConversations(): ConversationStore {
   }
 }
 
-function saveConversations(store: ConversationStore): void {
-  localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(store));
+function saveConversations(
+  store: ConversationStore,
+  changedConversation?: Conversation,
+): void {
+  writeConversations(store, conversationStorageKey());
+  if (activeUserId && changedConversation) {
+    queueConversationSync(activeUserId, changedConversation);
+  }
+}
+
+function writeConversations(store: ConversationStore, key: string): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(store));
+  } catch {
+    notifyHistorySyncError('Não foi possível salvar o cache local do histórico.');
+  }
+}
+
+function notifyHistorySyncError(message: string): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('openjarvis:history-sync-error', { detail: message }),
+    );
+  }
+}
+
+function queueConversationSync(userId: string, conversation: Conversation): void {
+  const key = `${userId}:${conversation.id}`;
+  const existing = conversationSyncTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const snapshot = JSON.parse(JSON.stringify(conversation)) as Conversation;
+  pendingConversationSyncs.set(key, snapshot);
+  const timer = setTimeout(() => {
+    conversationSyncTimers.delete(key);
+    void sendConversationSnapshot(key, snapshot);
+  }, 300);
+  conversationSyncTimers.set(key, timer);
+}
+
+async function sendConversationSnapshot(
+  key: string,
+  conversation: Conversation,
+): Promise<void> {
+  const active = activeConversationSyncs.get(key);
+  if (active) {
+    await active;
+    return sendConversationSnapshot(key, conversation);
+  }
+  pendingConversationSyncs.delete(key);
+  const request = (async () => {
+    try {
+      const response = await apiFetch('/v1/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(conversation),
+      });
+      if (!response.ok && response.status !== 401) {
+        notifyHistorySyncError('Não foi possível salvar o histórico no servidor.');
+      }
+    } catch {
+      notifyHistorySyncError('Não foi possível salvar o histórico no servidor.');
+    }
+  })();
+  activeConversationSyncs.set(key, request);
+  try {
+    await request;
+  } finally {
+    if (activeConversationSyncs.get(key) === request) {
+      activeConversationSyncs.delete(key);
+    }
+  }
+}
+
+function cancelConversationSync(userId: string, conversationId: string): void {
+  const key = `${userId}:${conversationId}`;
+  const timer = conversationSyncTimers.get(key);
+  if (timer) clearTimeout(timer);
+  conversationSyncTimers.delete(key);
+  pendingConversationSyncs.delete(key);
+}
+
+export function readLegacyConversations(): Conversation[] {
+  return Object.values(loadConversations(CONVERSATIONS_KEY).conversations);
+}
+
+export function clearLegacyConversations(): void {
+  try {
+    localStorage.removeItem(CONVERSATIONS_KEY);
+  } catch {
+    notifyHistorySyncError('Não foi possível limpar o histórico legado local.');
+  }
 }
 
 export type ThemeMode = 'light' | 'dark' | 'system';
@@ -192,12 +291,16 @@ interface AppState {
 
   // Actions: conversations
   loadConversations: () => void;
+  activateUserConversations: (userId: string, remote: Conversation[]) => void;
+  flushConversationSync: () => Promise<void>;
+  clearUserData: () => void;
   importOverlayConversation: () => Promise<void>;
   createConversation: (model?: string, title?: string) => string;
   selectConversation: (id: string) => void;
   deleteConversation: (id: string) => void;
   loadMessages: (conversationId: string | null) => void;
   addMessage: (conversationId: string, message: ChatMessage) => void;
+  updateMessageContent: (conversationId: string, messageId: string, content: string) => void;
   updateLastAssistant: (
     conversationId: string,
     content: string,
@@ -319,6 +422,89 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
+    activateUserConversations: (userId, remote) => {
+      activeUserId = userId;
+      const local = loadConversations();
+      const conversations = new Map(
+        remote.map((conversation) => [conversation.id, conversation]),
+      );
+      for (const conversation of Object.values(local.conversations)) {
+        const remoteConversation = conversations.get(conversation.id);
+        if (!remoteConversation || conversation.updatedAt > remoteConversation.updatedAt) {
+          conversations.set(conversation.id, conversation);
+          queueConversationSync(userId, conversation);
+        }
+      }
+      const merged = Object.fromEntries(conversations);
+      const activeId =
+        local.activeId && merged[local.activeId]
+          ? local.activeId
+          : Object.values(merged).sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? null;
+      const store: ConversationStore = {
+        version: 1,
+        conversations: merged,
+        activeId,
+      };
+      writeConversations(store, conversationStorageKey(userId));
+      set({
+        conversations: Object.values(merged).sort(
+          (a, b) => b.updatedAt - a.updatedAt,
+        ),
+        activeId,
+        messages: activeId ? merged[activeId]?.messages ?? [] : [],
+        streamState: INITIAL_STREAM,
+        agentEvents: [],
+        logEntries: [],
+        cachedConnectors: null,
+        managedAgents: [],
+        selectedAgentId: null,
+      });
+    },
+
+    flushConversationSync: async () => {
+      const pending = Array.from(pendingConversationSyncs.entries());
+      const sends: Promise<void>[] = [];
+      for (const [key, conversation] of pending) {
+        const timer = conversationSyncTimers.get(key);
+        if (timer) clearTimeout(timer);
+        conversationSyncTimers.delete(key);
+        sends.push(sendConversationSnapshot(key, conversation));
+      }
+      await Promise.all([...sends, ...activeConversationSyncs.values()]);
+    },
+
+    clearUserData: () => {
+      const userId = activeUserId;
+      for (const timer of conversationSyncTimers.values()) clearTimeout(timer);
+      conversationSyncTimers.clear();
+      pendingConversationSyncs.clear();
+      if (userId) {
+        try {
+          localStorage.removeItem(conversationStorageKey(userId));
+        } catch {
+          notifyHistorySyncError('Não foi possível limpar o cache local do histórico.');
+        }
+      }
+      activeUserId = null;
+      set({
+        conversations: [],
+        activeId: null,
+        messages: [],
+        streamState: INITIAL_STREAM,
+        serverInfo: null,
+        savings: null,
+        liveEnergy: null,
+        cachedConnectors: null,
+        managedAgents: [],
+        managedAgentsLoading: false,
+        selectedAgentId: null,
+        agentEvents: [],
+        logEntries: [],
+        models: [],
+        selectedModel: '',
+      });
+    },
+
     importOverlayConversation: async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
@@ -344,7 +530,7 @@ export const useAppStore = create<AppState>((set, get) => {
           model: overlay.model || 'default',
           messages: overlay.messages,
         };
-        saveConversations(store);
+        saveConversations(store, store.conversations[overlay.id]);
         set({
           conversations: Object.values(store.conversations).sort(
             (a, b) => b.updatedAt - a.updatedAt,
@@ -367,7 +553,7 @@ export const useAppStore = create<AppState>((set, get) => {
       };
       store.conversations[conv.id] = conv;
       store.activeId = conv.id;
-      saveConversations(store);
+      saveConversations(store, conv);
       set({
         conversations: Object.values(store.conversations).sort(
           (a, b) => b.updatedAt - a.updatedAt,
@@ -400,6 +586,30 @@ export const useAppStore = create<AppState>((set, get) => {
         store.activeId = remaining.length > 0 ? remaining[0] : null;
       }
       saveConversations(store);
+      if (activeUserId) {
+        const userId = activeUserId;
+        const key = `${userId}:${id}`;
+        cancelConversationSync(userId, id);
+        const activeSync = activeConversationSyncs.get(key);
+        void (async () => {
+          if (activeSync) await activeSync;
+          try {
+            const response = await apiFetch(
+              `/v1/conversations/${encodeURIComponent(id)}`,
+              { method: 'DELETE' },
+            );
+            if (
+              !response.ok &&
+              response.status !== 404 &&
+              response.status !== 401
+            ) {
+              notifyHistorySyncError('Não foi possível excluir a conversa do servidor.');
+            }
+          } catch {
+            notifyHistorySyncError('Não foi possível excluir a conversa do servidor.');
+          }
+        })();
+      }
       const convList = Object.values(store.conversations).sort(
         (a, b) => b.updatedAt - a.updatedAt,
       );
@@ -434,7 +644,25 @@ export const useAppStore = create<AppState>((set, get) => {
           message.content.slice(0, 50) +
           (message.content.length > 50 ? '...' : '');
       }
-      saveConversations(store);
+      saveConversations(store, conv);
+      const conversations = Object.values(store.conversations).sort(
+        (a, b) => b.updatedAt - a.updatedAt,
+      );
+      if (get().activeId === conversationId) {
+        set({ messages: [...conv.messages], conversations });
+      } else {
+        set({ conversations });
+      }
+    },
+
+    updateMessageContent: (conversationId: string, messageId: string, content: string) => {
+      const store = loadConversations();
+      const conv = store.conversations[conversationId];
+      const message = conv?.messages.find((candidate) => candidate.id === messageId);
+      if (!conv || !message) return;
+      message.content = content;
+      conv.updatedAt = Date.now();
+      saveConversations(store, conv);
       const conversations = Object.values(store.conversations).sort(
         (a, b) => b.updatedAt - a.updatedAt,
       );
@@ -468,7 +696,7 @@ export const useAppStore = create<AppState>((set, get) => {
         if (researchTraces) lastMsg.researchTraces = researchTraces;
         if (researchSources) lastMsg.researchSources = researchSources;
         conv.updatedAt = Date.now();
-        saveConversations(store);
+        saveConversations(store, conv);
         if (get().activeId === conversationId) {
           set({ messages: [...conv.messages] });
         }

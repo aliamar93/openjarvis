@@ -8,7 +8,8 @@ from unittest.mock import MagicMock
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient as UnauthenticatedTestClient  # noqa: E402
+from tests.server.auth_test_client import AuthenticatedTestClient as TestClient  # noqa: E402
 
 from openjarvis.server.app import create_app  # noqa: E402
 
@@ -97,6 +98,16 @@ class TestPWAServing:
         assert resp.status_code == 200
         data = resp.json()
         assert data["object"] == "list"
+
+    def test_auth_me_without_session_returns_json_not_spa(self, client_with_static):
+        """Auth endpoints must not fall through to the static SPA shell."""
+        client = UnauthenticatedTestClient(client_with_static.app)
+        assert client.get("/").headers["content-type"].startswith("text/html")
+
+        response = client.get("/auth/me")
+        assert response.status_code == 401
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json()["detail"] == "Sessão inválida ou expirada."
 
     def test_path_traversal_blocked(self, client_with_static):
         """Path traversal attempts should fall back to index.html."""
